@@ -1,0 +1,18 @@
+- Iteration 1: single vectorization of valu operations, etc.
+  - 31809
+- Iteration 2: overlap alu and load for the part that has to be sequentialized
+  - 28225
+- Iteration 3: FMA for idx calc
+  - 27713
+- Iteration 4: FMA for hash
+  - 26181
+- Iteration 5: Switch order of outer loops to amortize load/store
+  - 22213
+- Iteration 6: Pack store of current batch and load of next batch into one instruction
+  - **22152**
+
+TODO:
+
+- Then, pack more VLIW stuff together
+
+Target: 1487

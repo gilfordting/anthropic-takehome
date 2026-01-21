@@ -9,7 +9,11 @@
 - Iteration 5: Switch order of outer loops to amortize load/store
   - 22213
 - Iteration 6: Pack store of current batch and load of next batch into one instruction
-  - **22152**
+  - 22152
+- Iteration 7: Simplify 3 of the hash functions further; some more parallel packing for hash building. now either 1 or 2 instructions
+  - 12937
+- Iteration 8: Super easy index wraparound; more compact index update
+  - 10857
 
 TODO:
 

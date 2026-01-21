@@ -87,3 +87,45 @@
 - scratch size is 1536, which is 192 vregs
 - valu has FMA, which can be used for some hash stages and index update
 - switch the loops; this allows for copying to be amortized across rounds
+
+# analysis/observations
+
+- everything starts at 0 index, so we don't actually need to load indices
+- everything completes in one-cycle, no stalling
+- we're severely bottlenecked on load slots because of the NUMA pattern, where we load from `values`
+- height is 10, this means number of nodes is 2047
+  - this won't fit in scratch space, but half of it can! (1024)
+
+## control flow
+
+- tree depth proceeds in a very predictable fashion:
+  - 0 -> 2 -> 6 -> 14 -> 30 -> 62 -> 126 -> 254 -> 510 -> 1022 -> 2046 -> 0
+  - on round 11 is when we circle back, so round is effectively mod tree_height+1
+    - end of round 10 is when we set indices to 0. this is tree_height
+  - definitely feasible to avoid loading for rounds 0, 1, 2 (11, 12, 14 also)
+- wraparound check only needs to happen on round 10
+  - this isn't even a check, we just set them all to 0
+
+## arithmetic
+
+****
+
+- several of the hash functions (0, 2, 4) are (x + const) + (x \*2^n); this can be turned into a single multiply-add like const + x\* (1 + 2^n)
+- index update can be turned into 2*idx + 2 - (val % 2)
+- hash can probably be pipelined across multiple batches/vectors at once (6 valu slots)
+
+## loading
+
+- if we switch the order of the loops, we only need to load `val` once; amortized across all rounds
+  - this is 64 vloads in total, 32 instructions
+- we don't need to load indices, since they all start at 0
+- completely random data access eats up load slots, because they can't be vectorized
+  - worst case: this is 1 load per item per round, so 16*256 = 4096 loads, 2048 instructions. this cannot do
+  - notice that the top portion of the tree will be reused more than the bottom half, because it's less spread out
+- how can we load the tree into scratch (vectorized) and then distribute appropriately?
+  - seems reasonable to broadcast to treeval0,1,2...7 to do some stuff
+  - this will get more complicated the further down you go
+
+## TODO
+
+- [ ] fix scratch_const; preload everything

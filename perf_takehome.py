@@ -238,7 +238,7 @@ class KernelBuilder:
         body = []  # array of slots
 
         # Scalar scratch registers
-        tmp_addr1, tmp_addr2, tmp_addr3, tmp_addr4 = (
+        tmp_addr1, tmp_addr2 = (
             self.alloc_scratch(f"tmp_addr{i + 1}") for i in range(4)
         )
 
@@ -246,7 +246,7 @@ class KernelBuilder:
         vtmp_idx = self.alloc_scratch("vtmp_idx", VLEN)
         vtmp_val = self.alloc_scratch("vtmp_val", VLEN)
         vtmp_node_val = self.alloc_scratch("vtmp_node_val", VLEN)
-        vimm = self.alloc_scratch("vimm", VLEN)
+
         vconst0, vconst1, vconst2 = (
             self.alloc_scratch(f"vconst{i}", VLEN) for i in range(3)
         )
@@ -256,15 +256,30 @@ class KernelBuilder:
         vconst_nnodes = self.alloc_scratch("vconst_nnodes", VLEN)
         self.add("valu", ("vbroadcast", vconst_nnodes, self.scratch["n_nodes"]))
         vtmp1, vtmp2, vtmp3 = (
-            self.alloc_scratch(f"vtmp{i + i}", VLEN) for i in range(3)
+            self.alloc_scratch(f"vtmp{i + 1}", VLEN) for i in range(3)
         )
+
+        # Precompute vectorized constants for hahing
+        hash_add_consts = {}
+        vhash_add_consts = {}
         hash_shift_consts = {}
         vhash_shift_consts = {}
-        for i, val in zip((0, 2, 4), (12, 5, 3)):
-            hash_shift_consts[i] = self.scratch_const(2**val)
-            vhash_shift_consts[i] = self.alloc_scratch(f"vhash_shift_consts{i}", VLEN)
-            self.add(
-                "valu", ("vbroadcast", vhash_shift_consts[i], hash_shift_consts[i])
+        for i in range(len(HASH_STAGES)):
+            _, const, _, _, shift = HASH_STAGES[i]
+            hash_add_consts[i] = self.scratch_const(const)
+            vhash_add_consts[i] = self.alloc_scratch(f"vhash_add_consts{i}", VLEN)
+            hash_shift_consts[i] = self.scratch_const(
+                1 + 2**shift if i in (0, 2, 4) else shift
+            )
+            vhash_shift_consts[i] = self.alloc_scratch(f"vhash_mult_consts{i}", VLEN)
+            self.add_bundle(
+                [
+                    ("valu", ("vbroadcast", vhash_add_consts[i], hash_add_consts[i])),
+                    (
+                        "valu",
+                        ("vbroadcast", vhash_shift_consts[i], hash_shift_consts[i]),
+                    ),
+                ]
             )
 
         for i_base in range(0, batch_size, VLEN):
@@ -279,15 +294,6 @@ class KernelBuilder:
                             (
                                 "+",
                                 tmp_addr1,
-                                self.scratch["inp_indices_p"],
-                                i_base_const,
-                            ),
-                        ),
-                        (
-                            "alu",
-                            (
-                                "+",
-                                tmp_addr2,
                                 self.scratch["inp_values_p"],
                                 i_base_const,
                             ),
@@ -296,8 +302,8 @@ class KernelBuilder:
                 )
                 body.append(
                     [
-                        ("load", ("vload", vtmp_idx, tmp_addr1)),
-                        ("load", ("vload", vtmp_val, tmp_addr2)),
+                        ("valu", ("vbroadcast", vtmp_idx, zero_const)),
+                        ("load", ("vload", vtmp_val, tmp_addr1)),
                     ]
                 )
             for round in range(rounds):
@@ -317,7 +323,10 @@ class KernelBuilder:
                 for i_off in range(1, VLEN):
                     body.append(
                         [
-                            ("load", ("load", vtmp_node_val + i_off - 1, tmp_addr1)),
+                            (
+                                "load",
+                                ("load", vtmp_node_val + i_off - 1, tmp_addr1),
+                            ),
                             (
                                 "alu",
                                 (
@@ -343,34 +352,32 @@ class KernelBuilder:
                     )
                 )
                 body.extend(
-                    self.vbuild_hash(vtmp_val, vtmp1, vtmp2, vimm, vhash_shift_consts)
+                    self.vbuild_hash(
+                        vtmp_val,
+                        vtmp1,
+                        vhash_add_consts,
+                        vhash_shift_consts,
+                    )
                 )
+
+                if round == forest_height:
+                    # set all indices back to 0
+                    body.append(("valu", ("vbroadcast", vtmp_idx, zero_const)))
+                    continue
+
+                # otherwise, we have to update indices
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("valu", ("%", vtmp1, vtmp_val, vconst2)))
-                body.append(("valu", ("==", vtmp1, vtmp1, vconst0)))
-                body.append(("flow", ("vselect", vtmp3, vtmp1, vconst1, vconst2)))
+                # this is equivalent to: idx = 2*idx + 1 + (val % 2)
+                # Calculate 2*idx + 1 (vtmp1) and val % 2 (vtmp2) in parallel
+                # then idx = vtmp1 + vtmp2
                 body.append(
-                    ("valu", ("multiply_add", vtmp_idx, vtmp_idx, vconst2, vtmp3))
+                    [
+                        ("valu", ("multiply_add", vtmp1, vconst2, vtmp_idx, vconst1)),
+                        ("valu", ("%", vtmp2, vtmp_val, vconst2)),
+                    ]
                 )
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(
-                    (
-                        "valu",
-                        ("<", vtmp1, vtmp_idx, vconst_nnodes),
-                    )
-                )
-                body.append(
-                    (
-                        "flow",
-                        (
-                            "vselect",
-                            vtmp_idx,
-                            vtmp1,
-                            vtmp_idx,
-                            vconst0,
-                        ),
-                    )
-                )
+                body.append(("valu", ("+", vtmp_idx, vtmp1, vtmp2)))
+
             # mem[inp_indices_p + i] = idx
             # also prefetch the next iteration
             body.append(
@@ -379,27 +386,9 @@ class KernelBuilder:
                         "alu",
                         (
                             "+",
-                            tmp_addr3,
-                            self.scratch["inp_indices_p"],
-                            i_base_const,
-                        ),
-                    ),
-                    (
-                        "alu",
-                        (
-                            "+",
-                            tmp_addr4,
+                            tmp_addr1,
                             self.scratch["inp_values_p"],
                             i_base_const,
-                        ),
-                    ),
-                    (
-                        "alu",
-                        (
-                            "+",
-                            tmp_addr1,
-                            self.scratch["inp_indices_p"],
-                            next_i_base_const,
                         ),
                     ),
                     (
@@ -414,12 +403,12 @@ class KernelBuilder:
                 ]
             )
             ldst_inst = [
-                ("store", ("vstore", tmp_addr4, vtmp_val)),  # Only need to store val
+                ("store", ("vstore", tmp_addr1, vtmp_val)),  # Only need to store val
             ]
             if i_base + VLEN < batch_size:
                 ldst_inst.extend(
                     [
-                        ("load", ("vload", vtmp_idx, tmp_addr1)),
+                        ("valu", ("vbroadcast", vtmp_idx, zero_const)),
                         ("load", ("vload", vtmp_val, tmp_addr2)),
                     ]
                 )
@@ -430,29 +419,10 @@ class KernelBuilder:
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
-    def vbuild_hash(self, val_hash_addr, tmp1, tmp2, imm, vhash_shift_consts):
+    def vbuild_hash(self, val_hash_addr, vtmp, vhash_add_consts, vhash_shift_consts):
         slots = []
         # (val_hash_addr op1 val1) op2 (val_hash_addr op3 val3)
         for i, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(
-                (
-                    "valu",
-                    ("vbroadcast", imm, self.scratch_const(val1)),
-                )
-            )
-            slots.append(
-                (
-                    "valu",
-                    (op1, tmp1, val_hash_addr, imm),
-                )
-            )
-            slots.append(
-                (
-                    "valu",
-                    ("vbroadcast", imm, self.scratch_const(val3)),
-                )
-            )
-            # Stages 0, 2, 4 can use FMAs instead
             if i in (0, 2, 4):
                 slots.append(
                     (
@@ -462,13 +432,19 @@ class KernelBuilder:
                             val_hash_addr,
                             val_hash_addr,
                             vhash_shift_consts[i],
-                            tmp1,
+                            vhash_add_consts[i],
                         ),
                     )
                 )
                 continue
-            slots.append(("valu", (op3, tmp2, val_hash_addr, imm)))
-            slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
+            # Otherwise, do two ops in parallel, then combine
+            slots.append(
+                [
+                    ("valu", (op1, val_hash_addr, val_hash_addr, vhash_add_consts[i])),
+                    ("valu", (op3, vtmp, val_hash_addr, vhash_shift_consts[i])),
+                ]
+            )
+            slots.append(("valu", (op2, val_hash_addr, val_hash_addr, vtmp)))
         return slots
 
 

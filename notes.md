@@ -93,8 +93,10 @@
 - everything starts at 0 index, so we don't actually need to load indices
 - everything completes in one-cycle, no stalling
 - we're severely bottlenecked on load slots because of the NUMA pattern, where we load from `values`
+  - how much does caching help us?
 - height is 10, this means number of nodes is 2047
   - this won't fit in scratch space, but half of it can! (1024)
+- some basic bottleneck analysis:
 
 ## control flow
 
@@ -126,6 +128,44 @@
   - seems reasonable to broadcast to treeval0,1,2...7 to do some stuff
   - this will get more complicated the further down you go
 
+## VLIW scheduling
+
+- probably need some sort of scheduler where we can see ops to be scheduled?
+  - would be cool to make a scoreboard
+
+## bottleneck analysis
+
+- 16 rounds and batch size of 256
+- load initial val for each item, vectorized: 256/8 = 64 loads/2 = 32 cycles; this is unavoidable
+- how about random access? naive, serialized gather with no caching needs 1 per round per item, so 256*16 = 4096 / 2 = 2048 cycles
+- if we cache N of the top layers, they're used twice (up to a certain point)
+- so 256*(16-2N)/2 = 2048 - 256N
+- 32+2048 - 256N < 1400? N > 2.65. this makes sense
+  - N = 3 means 1312 is possible if we have perfect packing
+  - N = 4 means we can get to 1056, and this is only two vloads
+  - N = 5 means 800, but seems a lot hairier? 4 vloads
+- how are we going to make use of cache?
+  - round 0: one possibility
+  - round 1: two possibilities, 1 vselect
+  - round 2: 4, 2 vselects
+  - round 3: 8, 3 vselects
+  - round 4: 8, 4 vselects
+- vselect is flow, which is basically free
+
+## scratch space analysis
+
+- 8 scalar global vars
+- 3 scalar constants
+- 2 address registers
+- 3x8 vector constants
+- 3x8 vector variables
+- 3x8 vector temporaries
+- 6x9 vectorized hash constants + scalar counterpart
+- (2^N-1)x8 vectorized forest values
+- i_base constants: 256/8 = 64 of these
+- 203 + 8(2^N-1) = 1536 -->  N = 7.39 as max cache depth? 128 cached items.
+- Might have to adjust this after VLIW pipelining, though -- that will probably take linear amt relative to number of active batches
+
 ## TODO
 
-- [ ] fix scratch_const; preload everything
+- [ ] fix scratch_const; preload and bundle everything

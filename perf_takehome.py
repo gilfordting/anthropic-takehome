@@ -220,9 +220,10 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        tmp = self.alloc_scratch("tmp")
+        tmp = self.alloc_scratch("tmp")  # This needs to be allocated, for
         # There are 8 of these, so we can just do a vectorized load once we have a 0 to work with
         zero_const, one_const, two_const = (self.scratch_const(i) for i in range(3))
+        # This loads our variables from constant mem into scratch space
         self.add("load", ("vload", 0, zero_const))
 
         # Pause instructions are matched up with yield statements in the reference

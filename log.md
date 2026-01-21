@@ -14,6 +14,8 @@
   - 12937
 - Iteration 8: Super easy index wraparound; more compact index update
   - 10857
+- Iteration 9: Caching + using nodes 0, 1, 2
+  - 9820
 
 TODO:
 

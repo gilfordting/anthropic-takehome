@@ -483,6 +483,18 @@ def reference_kernel(t: Tree, inp: Input):
             inp.values[i] = val
             inp.indices[i] = idx
 
+def reference_kernel_simplified(t: Tree, inp: Input):
+    for i in range(len(inp.indices)):
+        idx = 0
+        val = inp.values[i]
+        for h in range(inp.rounds):
+            val = myhash(val ^ t.values[idx])
+            if h == t.height:
+                idx = 0
+                continue
+            idx = (2 * idx + 1) + (val % 2)
+        inp.values[i] = val
+
 
 def build_mem_image(t: Tree, inp: Input) -> list[int]:
     """

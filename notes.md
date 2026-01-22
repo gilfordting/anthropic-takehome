@@ -110,8 +110,6 @@
 
 ## arithmetic
 
-****
-
 - several of the hash functions (0, 2, 4) are (x + const) + (x \*2^n); this can be turned into a single multiply-add like const + x\* (1 + 2^n)
 - index update can be turned into 2*idx + 2 - (val % 2)
 - hash can probably be pipelined across multiple batches/vectors at once (6 valu slots)
@@ -136,6 +134,9 @@
 ## bottleneck analysis
 
 - 16 rounds and batch size of 256
+
+### load
+
 - load initial val for each item, vectorized: 256/8 = 64 loads/2 = 32 cycles; this is unavoidable
 - how about random access? naive, serialized gather with no caching needs 1 per round per item, so 256*16 = 4096 / 2 = 2048 cycles
 - if we cache N of the top layers, they're used twice (up to a certain point)
@@ -150,7 +151,20 @@
   - round 2: 4, 2 vselects
   - round 3: 8, 3 vselects
   - round 4: 8, 4 vselects
-- vselect is flow, which is basically free
+- conclusion: num cycles when caching N of the top layers is 2080 - 256N
+
+### alu/valu
+
+- alu throughput is 12 + 6*8 = 60 ops/cycle
+- multiply_add counts as one op
+- 3 of the hash stages are 3 ops, 3 of them can be expressed as just 1 op; in total this is 12 ops
+- 16 rounds, 256 items: 49,152 ops required. 819.2 cycles; this is a more fundamental bottleneck?
+  - this implies going past N = 5 for caching won't help us, since the bottleneck shifts here
+
+### flow
+
+- selects are used to filter through the cache
+- round 0: no filtering,
 
 ## scratch space analysis
 
@@ -169,3 +183,53 @@
 ## TODO
 
 - [ ] fix scratch_const; preload and bundle everything
+
+## pseudocode
+
+round 0:
+look at val and update idx, treeval
+left if even, right if odd
+2x+1 if even, 2x+2 if odd
+
+round 0:
+val = hash(val ^ tree0)
+parity = val % 2
+@parallel
+  idx = 1 + parity
+  treeval = parity \* (v2-v1) + v1
+
+round 1:
+@parallel
+  val = hash(val ^ treeval)
+  idx = 2*idx + 1
+@parallel
+  parity = val % 2
+  tmpidx = idx - 3
+  
+@parallel
+  diff1 = parity \* (v4-v3) + v3
+  diff2 = parity \* (v6-v5) + v5
+  idx = idx + parity  # this is final
+  
+@parallel
+  ddiff = diff2 - diff1
+  tmpidx = tmpidx >> 1
+treeval = tmpidx \* ddiff + diff1
+
+round 2+:
+@parallel
+  val = hash(val ^ treeval)
+  idx = 2*idx + 1
+
+parity = val % 2
+idx = idx + parity
+treeval = gather(idx)
+
+wraparound round:
+val = hash(val ^ treeval)
+don't need to set idx or treeval, hardcoded in r0
+
+last round:
+val = hash(val, treeval)
+store val
+load init val for next batch

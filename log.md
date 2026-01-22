@@ -16,6 +16,9 @@
   - 10857
 - Iteration 9: Caching + using nodes 0, 1, 2
   - 9820
+- Iteration 10: more caching, but more intelligent
+  - 9083
+-
 
 TODO:
 

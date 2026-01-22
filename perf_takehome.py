@@ -62,6 +62,19 @@ class KernelBlock:
                 "Hijacking exceeded slot limit"
             )
 
+    def interleave(self, other: "KernelBlock") -> "KernelBlock":
+        assert len(self.instrs) == len(other.instrs), (
+            "Blocks must have the same number of instructions"
+        )
+        block = KernelBlock()
+        for i in range(len(self.instrs)):
+            merged_instr = defaultdict(list)
+            for engine in ("alu", "valu", "load", "store", "flow", "debug"):
+                merged_instr[engine].extend(self.instrs[i][engine])
+                merged_instr[engine].extend(other.instrs[i][engine])
+            block.instrs.append(merged_instr)
+        return block
+
 
 class KernelBuilder:
     def __init__(self):
@@ -73,31 +86,6 @@ class KernelBuilder:
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
-
-    # def make_bundle(self, insts):
-    #     vliw_inst = defaultdict(list)
-    #     for engine, slot in insts:
-    #         vliw_inst[engine].append(slot)
-    #     return vliw_inst
-
-    # def build(
-    #     self,
-    #     slots: list[Union[tuple[Engine, tuple], list[tuple[Engine, tuple]]]],
-    #     vliw: bool = False,
-    # ):
-    #     # If any of the individual slots are lists, converts to VLIW bundle
-    #     # Simple slot packing that just uses one slot per instruction bundle
-    #     instrs = []
-    #     for v in slots:
-    #         if isinstance(v, list):
-    #             instrs.append(self.make_bundle(v))
-    #             continue
-    #         engine, slot = v
-    #         instrs.append({engine: [slot]})
-    #     return instrs
-
-    # def add_bundle(self, insts):
-    #     self.instrs.append(self.make_bundle(insts))
 
     def add_bundle(self, **kwargs):
         vliw_inst = {
@@ -270,7 +258,9 @@ class KernelBuilder:
         self.add("load", ("vload", 0, zero_const))
 
         # ---- Constants ----
-        vlen_const = self.scratch_const(VLEN)
+        vlen_const, vlen2_const, vlen3_const = [
+            self.scratch_const((i + 1) * VLEN) for i in range(3)
+        ]
         vconst0, vconst1, vconst2, vconst3 = (
             self.alloc_scratch(f"vconst{i}", VLEN) for i in range(4)
         )
@@ -304,58 +294,72 @@ class KernelBuilder:
         self.add_bundle(valu=broadcast_slots[:6])
         self.add_bundle(valu=broadcast_slots[6:])
 
-        # Diffs for caching + linear interpolation
-        vdiff21 = self.alloc_scratch("vdiff21", VLEN)
-        vdiff43 = self.alloc_scratch("vdiff43", VLEN)
-        vdiff65 = self.alloc_scratch("vdiff65", VLEN)
-        # Scratch registers for diffs
-        vdiff1, vdiff2 = (self.alloc_scratch(f"vdiff{i}", VLEN) for i in range(2))
-        vddiff = self.alloc_scratch("vddiff", VLEN)
+        # Constant diffs for caching + linear interpolation
+        vdiff21_const = self.alloc_scratch("vdiff21_const", VLEN)
+        vdiff43_const = self.alloc_scratch("vdiff43_const", VLEN)
+        vdiff65_const = self.alloc_scratch("vdiff65_const", VLEN)
 
         # ---- Scratch registers ----
+        # One per batch
+        N_BATCH = 2
 
         # Addresses
         tmp_addr1, tmp_addr2, tmp_addr3 = (
-            self.alloc_scratch(f"tmp_addr{i + 1}") for i in range(3)
+            [self.alloc_scratch(f"tmp_addr{i + 1}_batch{b}") for b in range(N_BATCH)]
+            for i in range(3)
         )
         # Vector
-        vidx = self.alloc_scratch("vidx", VLEN)
-        vtmpidx = self.alloc_scratch("vtmpidx", VLEN)
-        vval = self.alloc_scratch("vval", VLEN)
-        vtreeval = self.alloc_scratch("vtreeval", VLEN)
-        vparity = self.alloc_scratch("vparity", VLEN)
+        vidx = [self.alloc_scratch(f"vidx_batch{b}", VLEN) for b in range(N_BATCH)]
+        vtmpidx = [
+            self.alloc_scratch(f"vtmpidx_batch{b}", VLEN) for b in range(N_BATCH)
+        ]
+        vval = [self.alloc_scratch(f"vval_batch{b}", VLEN) for b in range(N_BATCH)]
+        vtreeval = [
+            self.alloc_scratch(f"vtreeval_batch{b}", VLEN) for b in range(N_BATCH)
+        ]
+        vparity = [
+            self.alloc_scratch(f"vparity_batch{b}", VLEN) for b in range(N_BATCH)
+        ]
         vtmp1, vtmp2, vtmp3 = (
-            self.alloc_scratch(f"vtmp{i + 1}", VLEN) for i in range(3)
+            [self.alloc_scratch(f"vtmp{i + 1}_batch{b}", VLEN) for b in range(N_BATCH)]
+            for i in range(3)
         )
+        # Scratch registers for diffs
+        vdiff1, vdiff2 = (
+            [self.alloc_scratch(f"vdiff{i}_batch{b}", VLEN) for b in range(N_BATCH)]
+            for i in range(2)
+        )
+        vddiff = [self.alloc_scratch(f"vddiff_batch{b}", VLEN) for b in range(N_BATCH)]
 
         # ---- Cache population ----
 
         # Preload the first 8 forest values
-        vforest_vals = [
+        vforest_vals_const = [
             self.alloc_scratch(f"vforest_vals{i}", VLEN) for i in range(VLEN)
         ]
-        self.add("load", ("vload", vforest_vals[0], self.scratch["forest_values_p"]))
+        self.add(
+            "load", ("vload", vforest_vals_const[0], self.scratch["forest_values_p"])
+        )
         self.add_bundle(
             valu=[
-                ("vbroadcast", vforest_vals[i], vforest_vals[0] + i)
+                ("vbroadcast", vforest_vals_const[i], vforest_vals_const[0] + i)
                 for i in range(VLEN)
                 if i >= VLEN // 2
             ]
         )
         self.add_bundle(
             valu=[
-                ("vbroadcast", vforest_vals[i], vforest_vals[0] + i)
+                ("vbroadcast", vforest_vals_const[i], vforest_vals_const[0] + i)
                 for i in range(VLEN)
                 if i < VLEN // 2
             ]
         )
-
         # Precompute differences between tree values
         self.add_bundle(
             valu=[
-                ("-", vdiff21, vforest_vals[2], vforest_vals[1]),
-                ("-", vdiff43, vforest_vals[4], vforest_vals[3]),
-                ("-", vdiff65, vforest_vals[6], vforest_vals[5]),
+                ("-", vdiff21_const, vforest_vals_const[2], vforest_vals_const[1]),
+                ("-", vdiff43_const, vforest_vals_const[4], vforest_vals_const[3]),
+                ("-", vdiff65_const, vforest_vals_const[6], vforest_vals_const[5]),
             ]
         )
 
@@ -369,6 +373,8 @@ class KernelBuilder:
 
         # ---- Main program ----
 
+        # TODO: now, let's try two batches at once!
+
         # Load initial values for first batch.
         # tmp_addr1 contains current address; used for storing
         # tmp_addr2 contains next address; used for loading
@@ -376,69 +382,80 @@ class KernelBuilder:
             alu=[
                 (
                     "+",
-                    tmp_addr1,
+                    tmp_addr1[0],
                     self.scratch["inp_values_p"],
                     zero_const,
                 ),
                 (
                     "+",
-                    tmp_addr2,
+                    tmp_addr2[0],
                     self.scratch["inp_values_p"],
-                    vlen_const,
+                    vlen2_const,
                 ),
+                ("+", tmp_addr1[1], self.scratch["inp_values_p"], vlen_const),
+                ("+", tmp_addr2[1], self.scratch["inp_values_p"], vlen3_const),
             ],
-            load=[("vload", vval, self.scratch["inp_values_p"])],
+            load=[
+                ("vload", vval[0], self.scratch["inp_values_p"]),
+            ],
         )
+        self.add_bundle(load=[("vload", vval[1], tmp_addr1[1])])
 
         block = KernelBlock()  # block of instructions
 
-        for i_base in range(0, batch_size, VLEN):
-            # In this loop, assume vtreeval is loaded
+        def batch_instrs(i_base, i_sub):
+            block = KernelBlock()
             for round in range(rounds):
                 # Round 0 is special case
                 if round % (forest_height + 1) == 0:
                     # At the top, we use tree0 for vtreeval
-                    block.add_bundle(valu=[("^", vval, vval, vforest_vals[0])])
+                    block.add_bundle(
+                        valu=[("^", vval[i_sub], vval[i_sub], vforest_vals_const[0])]
+                    )
                     block.append_block(
                         self.vbuild_hash(
-                            vval,
-                            vtmp1,
+                            vval[i_sub],
+                            vtmp1[i_sub],
                             vhash_add_consts,
                             vhash_shift_consts,
                         )
                     )
-                    block.add_bundle(valu=[("%", vparity, vval, vconst2)])
+                    block.add_bundle(valu=[("%", vparity[i_sub], vval[i_sub], vconst2)])
                     block.add_bundle(
                         valu=[
-                            ("+", vidx, vconst1, vparity),
+                            ("+", vidx[i_sub], vconst1, vparity[i_sub]),
                             (
                                 "multiply_add",
-                                vtreeval,
-                                vparity,
-                                vdiff21,
-                                vforest_vals[1],
+                                vtreeval[i_sub],
+                                vparity[i_sub],
+                                vdiff21_const,
+                                vforest_vals_const[1],
                             ),
                         ]
                     )
                     continue
                 # Round 1: most complicated
                 if round % (forest_height + 1) == 1:
-                    block.add_bundle(valu=[("^", vval, vval, vtreeval)])
+                    block.add_bundle(
+                        valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
+                    )
                     hash_block = self.vbuild_hash(
-                        vval,
-                        vtmp1,
+                        vval[i_sub],
+                        vtmp1[i_sub],
                         vhash_add_consts,
                         vhash_shift_consts,
                     )
                     hash_block.hijack_first(
-                        valu=[("multiply_add", vidx, vconst2, vidx, vconst1)]
+                        valu=[
+                            ("multiply_add", vidx[i_sub], vconst2, vidx[i_sub], vconst1)
+                        ]
                     )
                     block.append_block(hash_block)
                     # update parity and tmpidx
                     block.add_bundle(
                         valu=[
-                            ("%", vparity, vval, vconst2),
-                            ("-", vtmpidx, vidx, vconst3),
+                            ("%", vparity[i_sub], vval[i_sub], vconst2),
+                            ("-", vtmpidx[i_sub], vidx[i_sub], vconst3),
                         ]
                     )
                     # compute diffs
@@ -446,39 +463,49 @@ class KernelBuilder:
                         valu=[
                             (
                                 "multiply_add",
-                                vdiff1,
-                                vparity,
-                                vdiff43,
-                                vforest_vals[3],
+                                vdiff1[i_sub],
+                                vparity[i_sub],
+                                vdiff43_const,
+                                vforest_vals_const[3],
                             ),
                             (
                                 "multiply_add",
-                                vdiff2,
-                                vparity,
-                                vdiff65,
-                                vforest_vals[5],
+                                vdiff2[i_sub],
+                                vparity[i_sub],
+                                vdiff65_const,
+                                vforest_vals_const[5],
                             ),
-                            ("+", vidx, vidx, vparity),
+                            ("+", vidx[i_sub], vidx[i_sub], vparity[i_sub]),
                         ]
                     )
                     # compute diff of diffs and get higher bit of tmpidx
                     block.add_bundle(
                         valu=[
-                            ("-", vddiff, vdiff2, vdiff1),
-                            (">>", vtmpidx, vtmpidx, vconst1),
+                            ("-", vddiff[i_sub], vdiff2[i_sub], vdiff1[i_sub]),
+                            (">>", vtmpidx[i_sub], vtmpidx[i_sub], vconst1),
                         ]
                     )
                     block.add_bundle(
-                        valu=[("multiply_add", vtreeval, vtmpidx, vddiff, vdiff1)]
+                        valu=[
+                            (
+                                "multiply_add",
+                                vtreeval[i_sub],
+                                vtmpidx[i_sub],
+                                vddiff[i_sub],
+                                vdiff1[i_sub],
+                            )
+                        ]
                     )
                     continue
                 # Wraparound round
                 if (round + 1) % (forest_height + 1) == 0:
-                    block.add_bundle(valu=[("^", vval, vval, vtreeval)])
+                    block.add_bundle(
+                        valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
+                    )
                     block.append_block(
                         self.vbuild_hash(
-                            vval,
-                            vtmp1,
+                            vval[i_sub],
+                            vtmp1[i_sub],
                             vhash_add_consts,
                             vhash_shift_consts,
                         )
@@ -487,65 +514,86 @@ class KernelBuilder:
                 # Last round
                 if round == rounds - 1:
                     # First do the hashing. But then we don't need to load treeval or change idx or anything.
-                    block.add_bundle(valu=[("^", vval, vval, vtreeval)])
+                    block.add_bundle(
+                        valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
+                    )
                     block.append_block(
                         self.vbuild_hash(
-                            vval, vtmp1, vhash_add_consts, vhash_shift_consts
+                            vval[i_sub],
+                            vtmp1[i_sub],
+                            vhash_add_consts,
+                            vhash_shift_consts,
                         )
                     )
                     # tmp_addr1 has current address, used for storing; tmp_addr2 has next address, used for loading; update tmp_addr1 and tmp_addr2
                     # only issue load if there is more in batch
                     load_insts = (
-                        [("vload", vval, tmp_addr2)]
-                        if i_base + VLEN < batch_size
+                        [("vload", vval[i_sub], tmp_addr2[i_sub])]
+                        if i_base + 2 * VLEN < batch_size
                         else []
                     )
                     block.add_bundle(
-                        store=[("vstore", tmp_addr1, vval)],
+                        store=[("vstore", tmp_addr1[i_sub], vval[i_sub])],
                         alu=[
-                            ("+", tmp_addr1, tmp_addr1, vlen_const),
-                            ("+", tmp_addr2, tmp_addr2, vlen_const),
+                            ("+", tmp_addr1[i_sub], tmp_addr1[i_sub], vlen2_const),
+                            ("+", tmp_addr2[i_sub], tmp_addr2[i_sub], vlen2_const),
                         ],
                         load=load_insts,
                     )
                     continue
 
                 # Round 2+: steady-state
-                block.add_bundle(valu=[("^", vval, vval, vtreeval)])
+                block.add_bundle(
+                    valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
+                )
                 hash_block = self.vbuild_hash(
-                    vval,
-                    vtmp1,
+                    vval[i_sub],
+                    vtmp1[i_sub],
                     vhash_add_consts,
                     vhash_shift_consts,
                 )
                 hash_block.hijack_first(
-                    valu=[("multiply_add", vidx, vconst2, vidx, vconst1)]
+                    valu=[("multiply_add", vidx[i_sub], vconst2, vidx[i_sub], vconst1)]
                 )
                 block.append_block(hash_block)
                 block.add_bundle(
                     valu=[
-                        ("%", vparity, vval, vconst2),
+                        ("%", vparity[i_sub], vval[i_sub], vconst2),
                     ]
                 )
-                block.add_bundle(valu=[("+", vidx, vidx, vparity)])
+                block.add_bundle(valu=[("+", vidx[i_sub], vidx[i_sub], vparity[i_sub])])
                 # Gather using this index; first we need to calculate address
                 block.add_bundle(
-                    alu=[("+", tmp_addr3, self.scratch["forest_values_p"], vidx)]
+                    alu=[
+                        (
+                            "+",
+                            tmp_addr3[i_sub],
+                            self.scratch["forest_values_p"],
+                            vidx[i_sub],
+                        )
+                    ]
                 )
                 # Then overlap loads with address calc
                 for i_off in range(1, VLEN):
                     block.add_bundle(
-                        load=[("load", vtreeval + i_off - 1, tmp_addr3)],
+                        load=[("load", vtreeval[i_sub] + i_off - 1, tmp_addr3[i_sub])],
                         alu=[
                             (
                                 "+",
-                                tmp_addr3,
+                                tmp_addr3[i_sub],
                                 self.scratch["forest_values_p"],
-                                vidx + i_off,  # i_off'th element in vector
+                                vidx[i_sub] + i_off,  # i_off'th element in vector
                             )
                         ],
                     )
-                block.add_bundle(load=[("load", vtreeval + VLEN - 1, tmp_addr3)])
+                block.add_bundle(
+                    load=[("load", vtreeval[i_sub] + VLEN - 1, tmp_addr3[i_sub])]
+                )
+            return block
+
+        for i_base in range(0, batch_size, 2 * VLEN):
+            blocks = [batch_instrs(i_base, i_sub) for i_sub in range(2)]
+            block.append_block(blocks[0].interleave(blocks[1]))
 
         self.instrs.extend(block.instrs)
         # Required to match with the yield in reference_kernel2

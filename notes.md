@@ -318,9 +318,9 @@ Need to:
 
 ### Scalar
 
-- numerical: 0, 1, 2, 3
+- numerical: 0 to 7
   - load with `const`
-- vlens: factors 1, 2, 3
+- vlen (8)
   - load with `const`
 - hash: add factor, shift/mul factor, across 6 stages
   - load with `const`
@@ -334,7 +334,7 @@ Need to:
 
 these we need to
 
-- numerical: v0, v1, v2, v3
+- numerical: v0, v1, ... vI, v7
   - `vbroadcast` scalar after loaded
 - tree values: 8
   - `vbroadcast` scalars after loaded

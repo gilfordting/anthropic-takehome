@@ -419,6 +419,9 @@ def const(name: str) -> str:
 def vector(name: str) -> str:
     return f"{VECTOR_PREFIX}{name}"
 
+def vconst(name: str) -> str:
+    return const(vector(name))
+
 
 # localize a name to a batch and round
 def localize(name: str, batch: int, round: int) -> str:
@@ -516,7 +519,7 @@ def make_round0(
             batch=batch,
             round=round,
             op="valu^",
-            arg_names=[val_name, const("vtreeval0")],
+            arg_names=[val_name, vconst("treeval0")],
             dest=in0,
             frees={val_name},
         )
@@ -528,7 +531,7 @@ def make_round0(
             batch=batch,
             round=round,
             op="valu%",
-            arg_names=[val_name, const("v2")],
+            arg_names=[val_name, vconst("2")],
             dest=parity0,
         )
     )
@@ -538,7 +541,7 @@ def make_round0(
                 batch=batch,
                 round=round,
                 op="valu+",
-                arg_names=[parity0, const("v1")],
+                arg_names=[parity0, vconst("1")],
                 dest=idx_name,
                 frees={parity0},
             ),
@@ -546,7 +549,7 @@ def make_round0(
                 batch=batch,
                 round=round,
                 op="multiply_add",
-                arg_names=[parity0, const("vdiff21"), const("vtreeval1")],
+                arg_names=[parity0, vconst("diff21"), vconst("treeval1")],
                 dest=treeval_name,
                 frees={parity0},
             ),
@@ -581,7 +584,7 @@ def make_round1(
             batch=batch,
             round=round,
             op="multiply_add",
-            arg_names=[const("v2"), idx_name, const("v1")],
+            arg_names=[vconst("2"), idx_name, vconst("1")],
             dest=idx_name,
         )
     )
@@ -591,14 +594,14 @@ def make_round1(
                 batch=batch,
                 round=round,
                 op="valu%",
-                arg_names=[val_name, const("v2")],
+                arg_names=[val_name, vconst("2")],
                 dest=parity1,
             ),
             single_bundle(
                 batch=batch,
                 round=round,
                 op="valu-",
-                arg_names=[idx_name, const("v3")],
+                arg_names=[idx_name, vconst("3")],
                 dest=upperbit1,
             ),
         )
@@ -609,7 +612,7 @@ def make_round1(
                 batch=batch,
                 round=round,
                 op="multiply_add",
-                arg_names=[parity1, const("vdiff43"), const("vtreeval3")],
+                arg_names=[parity1, vconst("diff43"), vconst("treeval3")],
                 dest=diff1,
                 frees={parity1},
             ),
@@ -617,7 +620,7 @@ def make_round1(
                 batch=batch,
                 round=round,
                 op="multiply_add",
-                arg_names=[parity1, const("vdiff65"), const("vtreeval5")],
+                arg_names=[parity1, vconst("diff65"), vconst("treeval5")],
                 dest=diff2,
                 frees={parity1},
             ),
@@ -645,7 +648,7 @@ def make_round1(
                 batch=batch,
                 round=round,
                 op="valu>>",
-                arg_names=[upperbit1, const("v1")],
+                arg_names=[upperbit1, vconst("1")],
                 dest=upperbit1,
             ),
         )
@@ -749,7 +752,7 @@ def make_mid_round(
             op="valu^",
             arg_names=[val_name, treeval_name],
             dest=inX,
-            frees={val_name},
+            frees={val_name},  # don't free treeval, because it's used for gather
         )
     )
     bundles.extend(make_hash(inX, val_name, batch, round))
@@ -759,14 +762,14 @@ def make_mid_round(
                 batch=batch,
                 round=round,
                 op="valu%",
-                arg_names=[val_name, const("v2")],
+                arg_names=[val_name, vconst("2")],
                 dest=parityX,
             ),
             single_bundle(
                 batch=batch,
                 round=round,
                 op="multiply_add",
-                arg_names=[const("v2"), idx_name, const("v1")],
+                arg_names=[vconst("2"), idx_name, vconst("1")],
                 dest=idx_name,
             ),
         )
@@ -897,10 +900,8 @@ class KernelBuilder:
                 const_mapping[name] = reg
             return loads
 
-        num_loads = build_scalar_constants([(str(i), i) for i in range(4)])
-        vlen_loads = build_scalar_constants(
-            [(f"s_vlen{i + 1}", (i + 1) * VLEN) for i in range(3)]
-        )
+        num_loads = build_scalar_constants([(str(i), i) for i in range(8)])
+        vlen_loads = build_scalar_constants([("s_vlen", VLEN)])
         hash_add_loads = build_scalar_constants(
             [(f"hash_add{i}", imm) for i, (_, imm, _, _, _) in enumerate(HASH_STAGES)]
         )
@@ -995,53 +996,59 @@ class KernelBuilder:
         # Cycle 0: load 0, 1 scalar constants.
         # Cycle 1: vload init vars, 1 vlen load, vbroadcast 0 and 1.
         # Cycle 2: vload treevals,
-        MIN_CYCLES = 20
-        load_bundles = [[] for _ in range(MIN_CYCLES)]
-        valu_bundles = [[] for _ in range(MIN_CYCLES)]
+        MAX_CYCLES = 20
+        load_bundles = [[] for _ in range(MAX_CYCLES)]
+        valu_bundles = [[] for _ in range(MAX_CYCLES)]
         load_bundles[0].extend(num_loads[:2])
         load_bundles[1].extend([init_vars_vload, num_loads[2]])
         load_bundles[2].extend([treevals_vload, num_loads[3]])
+        load_bundles[3].extend(num_loads[4:6])
+        load_bundles[4].extend(num_loads[6:8])
         # cycles 3 and beyond: the 6 hash_add loads, then the 6 hash_mult loads, then valu
         for i in range(3):
-            load_bundles[3 + i].extend(hash_add_loads[i * 2 : i * 2 + 2])
+            load_bundles[5 + i].extend(hash_add_loads[i * 2 : i * 2 + 2])
         for i in range(3):
-            load_bundles[6 + i].extend(hash_mult_loads[i * 2 : i * 2 + 2])
-        for i in range(2):
-            load_bundles[9 + i].extend(vlen_loads[i * 2 : i * 2 + 2])
+            load_bundles[8 + i].extend(hash_mult_loads[i * 2 : i * 2 + 2])
+        load_bundles[11].extend(vlen_loads)
 
         # load 0: 0 and 1
         # load 1: vload init vars, 2
         # load 2: vload treevals, 3
-        # load 3: hashadds 0 and 1
-        # load 4: hashadds 2 and 3
-        # load 5: hashadds 4 and 5
-        # load 6: hashmults 0 and 1
-        # load 7: hashmults 2 and 3
-        # load 8: hashmults 4 and 5
-        # load 9: vlens 1 and 2
-        # load 10: vlen 3
+        # load 3: 4 and 5
+        # load 4: 6 and 7
+        # load 5: hashadds 0 and 1
+        # load 6: hashadds 2 and 3
+        # load 7: hashadds 4 and 5
+        # load 8: hashmults 0 and 1
+        # load 9: hashmults 2 and 3
+        # load 10: hashmults 4 and 5
+        # load 11: vlen
 
-        # outstanding: 0123, 8 treevals
+        valu_bundles[1].extend(num_vbroadcasts[0:2])
+        # outstanding: 2
+        valu_bundles[2].append(num_vbroadcasts[2])
+        # outstanding: 3, 8 treevals
         valu_bundles[3].extend([treeval_vbroadcasts[i] for i in (1, 2, 3, 4, 5, 6)])
-        # outstanding: 0123, treevals 0 and 7
+        # outstanding: 345, treevals 0 and 7
         valu_bundles[4].extend(
             vdiff_valus
             + [treeval_vbroadcasts[i] for i in (0, 7)]
-            + [num_vbroadcasts[0]]
+            + [num_vbroadcasts[3]]
         )
-        # outstanding: 123, hashadds 0-3
-        valu_bundles[5].extend(num_vbroadcasts[1:4] + hash_add_vbroadcasts[:3])
-        # outstanding: hashadds 345
-        valu_bundles[6].extend(hash_add_vbroadcasts[3:6])
+        # outstanding: 4567
+        valu_bundles[5].extend(num_vbroadcasts[4:8])
+        for i in range(3):
+            valu_bundles[6 + i].extend(hash_add_vbroadcasts[i * 2 : i * 2 + 2])
         # outstanding: hashmults 0-1
         for i in range(3):
-            valu_bundles[7 + i].extend(hash_mult_vbroadcasts[i * 2 : i * 2 + 2])
+            valu_bundles[9 + i].extend(hash_mult_vbroadcasts[i * 2 : i * 2 + 2])
 
         setup_cycle_count = 0
         for load_bundle, valu_bundle in zip(load_bundles, valu_bundles):
             if load_bundle or valu_bundle:
                 self.add_bundle(load=load_bundle, valu=valu_bundle)
                 setup_cycle_count += 1
+        # print(f"setup cycle count: {setup_cycle_count}")
         return const_mapping
 
     # Make scratch registers. Modifies scratch allocator but does not issue instructions.
@@ -1102,7 +1109,7 @@ class KernelBuilder:
                 ),
                 single_bundle(
                     op="+",
-                    arg_names=[const("inp_values_p"), const("s_vlen1")],
+                    arg_names=[const("inp_values_p"), const("s_vlen")],
                     dest=next_addr,
                 ),
             )
@@ -1158,7 +1165,7 @@ class KernelBuilder:
                     single_bundle(
                         batch=batch,
                         op="+",
-                        arg_names=[curr_addr, const("s_vlen1")],
+                        arg_names=[curr_addr, const("s_vlen")],
                         dest=batch_localize("curr_addr", batch + VLEN),
                         frees={curr_addr},
                         comment="i am here",
@@ -1166,7 +1173,7 @@ class KernelBuilder:
                     single_bundle(
                         batch=batch,
                         op="+",
-                        arg_names=[next_addr, const("s_vlen1")],
+                        arg_names=[next_addr, const("s_vlen")],
                         dest=batch_localize("next_addr", batch + VLEN),
                         frees={next_addr},
                     ),

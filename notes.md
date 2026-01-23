@@ -233,3 +233,111 @@ last round:
 val = hash(val, treeval)
 store val
 load init val for next batch
+
+## pseudocode, generalized
+
+long-lived registers: val, idx, treeval
+
+- val lives for the entire round
+- idx lives for one tree traversal
+each instruction also has associated freeing; which registers do we put back on the free list? (any instructions after this are free to use V0)
+
+TODO: expand hash
+
+prologue:
+val = load from addr (TODO??); define val
+
+R0 = R0 + const
+
+round 0:
+T0 = val ^ tree0_const; define T0; free val
+val = hash(T0); define val; free T0
+V0 = val % 2; define V0 (parity)
+@parallel; free V0; define idx, treeval
+  idx = 1 + V0
+  treeval = V0 \* (v2-v1) + v1
+
+round 1:
+T1 = val ^ treeval; define T1; free val, treeval
+@parallel; define val; free T1
+  val = hash(T1)
+  idx = 2*idx + 1  # no change, use same register
+
+@parallel; define V1 (parity), V2 (tmpidx/upper bit)
+  V1 = val % 2
+  V2 = idx - 3
+  
+@parallel; free V1; define D1, D2
+  D1 = V1 \* (v4-v3) + v3
+  D2 = V1 \* (v6-v5) + v5
+  idx = idx + V1  # this is final
+  
+@parallel; free D2; define ddiff
+  ddiff = D2 - D1
+  V2 = V2 >> 1
+
+treeval = V2 \* ddiff + D1; define treeval; free V2, ddiff, D1
+
+round 2+:
+T2 = val ^ treeval; define T2; free val, treeval
+@parallel; define val; free T2
+  val = hash(T2)
+  idx = 2*idx + 1
+
+V3 = val % 2; define V3 (parity)
+idx = idx + V3; free V3
+treeval = gather(idx); define treeval; free idx (only if next round is wraparound)
+
+wraparound round:
+Twrap = val ^ treeval; define Twrap; free val, treeval
+val = hash(Twrap); define val; free Twrap
+
+last round:
+Tlast = val ^ treeval; free val, treeval
+val = hash(Tlast); define val; free Tlast
+store val; free val
+load init val for next batch; define val
+
+hash:
+in is x
+x <- fma x, constmult, constadd
+
+## VLIW scheduler
+
+- have "long-term" and "emphemeral" registers
+- emphemeral registers can be used on the next cycle
+- "long-term" must be kept track of
+  - this is not a general solution?
+
+## Constant mapping
+
+Scalar constants that we then vectorize.
+
+### Scalar
+
+- provided variables
+  - load with `vload`
+- numerical: 0, 1, 2, 3
+  - load with `const`
+- hash constants: 2 for each of the 6 hash stages
+  - load with `const`
+- vlens: factors 1, 2, 3
+  - load with `const`
+
+### Vector
+
+- numerical: v0, v1, v2, v3
+  - `vbroadcast` scalar after loaded
+-
+
+# We have scalar constants, and then we vectorize them
+
+# Scalar constants
+
+# - all the provided variables. rounds, n_nodes, batch_size, forest_height, forest_values_p, inp_indices_p, inp_values_p
+
+# -
+
+# - numerical: 0, 1, 2, 3
+
+# -

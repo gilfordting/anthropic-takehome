@@ -20,6 +20,8 @@
   - 9083
 - Iteration 11: two batches at once
   - 4557
+- Iteration 12: symbolic execution engine and physical register file partitioning, 32 independent instruction streams, packed const loading, heuristic-based VLIW scheduler
+  - 1469
 
 TODO:
 

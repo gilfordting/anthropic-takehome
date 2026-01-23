@@ -403,3 +403,20 @@ check the number of scalar registers
 - and one for tmp in the initial section
 - tmp_addr for gather
 make_last_round; function signature was changed so change invocation
+
+## more bottleneck analysis
+
+- bottleneck on scratch space; peak vreg usage is 5, for round 1 but is short-lived
+- if we load even more we might screw smth up
+
+## VLIW scheduling
+
+32 instruction streams
+first heuristic: prioritize the streams with lowest depth to a load
+
+- any load? or a scalar load specifically?
+
+further optimizations:
+
+- split gather into either 1 or 2 load streams? depending on what's available
+- offload valu to 8 alu when overloaded

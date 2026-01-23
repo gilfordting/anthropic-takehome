@@ -199,6 +199,18 @@ class SymbolicInstructionSlot:
     def is_scalar(self) -> bool:
         return not self.is_vector
 
+    @property
+    def is_load(self) -> bool:
+        return self.engine == "load"
+
+    @property
+    def is_scalar_load(self) -> bool:
+        return self.is_load and self.is_scalar
+
+    @property
+    def is_store(self) -> bool:
+        return self.engine == "store"
+
 
 def make_slot(
     batch: int,
@@ -227,11 +239,29 @@ def make_slot(
 @dataclass
 class SymbolicBundle:
     slots: list[SymbolicInstructionSlot]
+    # Used for heuristics. These are populated by a higher-level function.
+    dist_to_load: int = None
+    dist_to_scalar_load: int = None
+    dist_to_end: int = None
 
     def __post_init__(self):
         # destination names must be unique
         dests = [slot.dest for slot in self.slots if slot.dest is not None]
         assert len(dests) == len(set(dests)), "destination names must be unique"
+
+    def check_slot_condition(self) -> bool:
+        for engine, limit in SLOT_LIMITS.items():
+            slots_for_engine = [slot for slot in self.slots if slot.engine == engine]
+            if len(slots_for_engine) > limit:
+                return False
+        return True
+
+    def merge(self, other: "SymbolicBundle") -> "SymbolicBundle":
+        return SymbolicBundle(slots=self.slots + other.slots)
+
+    def can_merge(self, other: "SymbolicBundle") -> bool:
+        merged = self.merge(other)
+        return merged.check_slot_condition()
 
     def to_concrete(
         self,
@@ -316,6 +346,18 @@ class SymbolicBundle:
 
         return inst
 
+    @property
+    def has_load(self) -> bool:
+        return any(slot.is_load for slot in self.slots)
+
+    @property
+    def has_scalar_load(self) -> bool:
+        return any(slot.is_scalar_load for slot in self.slots)
+
+    @property
+    def has_store(self) -> bool:
+        return any(slot.is_store for slot in self.slots)
+
 
 @dataclass
 class SymbolicProgram:
@@ -342,6 +384,36 @@ class SymbolicProgram:
         assert all(i in old_scalar_freelist for i in scalar_freelist)
 
         return insts
+
+    def populate_heuristics(self):
+        # lower is better
+        dist_to_load = float("inf")  # default: -1, no load below
+        dist_to_scalar_load = float("inf")
+        for i, bundle in enumerate(reversed(self.bundles)):
+            # if has load, 0 away! best case. reset counter
+            if bundle.has_load:
+                bundle.dist_to_load = 0
+                dist_to_load = 0
+            elif dist_to_load >= 0:
+                dist_to_load += 1
+                bundle.dist_to_load = dist_to_load
+            else:
+                bundle.dist_to_load = float("inf")
+            # scalar load specifically
+            if bundle.has_scalar_load:
+                bundle.dist_to_scalar_load = 0
+                dist_to_scalar_load = 0
+            elif dist_to_scalar_load >= 0:
+                dist_to_scalar_load += 1
+                bundle.dist_to_scalar_load = dist_to_scalar_load
+            else:
+                bundle.dist_to_scalar_load = float("inf")
+            bundle.dist_to_end = i
+
+    def get_bundle(self, pc: int) -> SymbolicBundle:
+        if pc >= len(self.bundles):
+            return None
+        return self.bundles[pc]
 
 
 def infer_engine(op: str) -> Engine:
@@ -411,6 +483,63 @@ def single_bundle(
 def multi_bundle(*args: SymbolicBundle) -> SymbolicBundle:
     return SymbolicBundle(slots=sum([bundle.slots for bundle in args], []))
 
+@dataclass
+class VLIWScheduler:
+    progs: list[SymbolicProgram]
+
+    def schedule(
+        self,
+        using: dict[str, int],
+        scalar_freelist: set[int],
+        vector_freelist: set[int],
+        consts: dict[str, int],
+    ) -> list[Instruction]:
+        insts = []
+        for prog in self.progs:
+            prog.populate_heuristics()
+
+        prog_counters = [0] * len(self.progs)
+        while any(
+            pc < len(prog.bundles) for pc, prog in zip(prog_counters, self.progs)
+        ):
+            bundle = None
+            streams = sorted(
+                range(len(self.progs)),
+                key=lambda x: (
+                    # self.progs[x].dist_to_load,
+                    self.progs[x].bundles[prog_counters[x]].dist_to_scalar_load
+                    if prog_counters[x] < len(self.progs[x].bundles)
+                    else float("inf"),
+                    x,  # if same, just schedule in order
+                ),
+            )
+
+            for i in streams:
+                bundle_i = self.progs[i].get_bundle(prog_counters[i])
+                if bundle_i is None:
+                    continue
+                if bundle is None:
+                    bundle = bundle_i
+                    prog_counters[i] += 1
+                elif bundle.can_merge(bundle_i):
+                    bundle = bundle.merge(bundle_i)
+                    prog_counters[i] += 1
+            assert bundle is not None, "no bundle found"
+            insts.append(
+                bundle.to_concrete(using, scalar_freelist, vector_freelist, consts)
+            )
+        return insts
+
+        # which programs are the most promising?
+        # we want to make sure load is utilized, so prioritize those.
+        # but we also don't want to get stuck in a state where we just stop after the last load, and then never actually do the store.
+
+        # sort by dist_to_load, then dist_to_scalar_load
+        # self.progs.sort(key=lambda x: (x.dist_to_load, x.dist_to_scalar_load))
+        # return [
+        #     prog.to_concrete(using, scalar_freelist, vector_freelist, consts)
+        #     for prog in self.progs
+        # ]
 
 def const(name: str) -> str:
     return f"{CONST_PREFIX}{name}"
@@ -1244,14 +1373,15 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
 
         # ---- Main program ----
-        bundles = []
-
+        progs = []
         for batch in range(0, batch_size, VLEN):
-            bundles.extend(make_batch_insts(batch, rounds, forest_height))
-        prog = SymbolicProgram(bundles)
-        self.instrs.extend(
-            prog.to_concrete({}, scalar_freelist, vector_freelist, consts)
-        )
+            progs.append(
+                SymbolicProgram(make_batch_insts(batch, rounds, forest_height))
+            )
+        scheduler = VLIWScheduler(progs)
+        insts = scheduler.schedule({}, scalar_freelist, vector_freelist, consts)
+        self.instrs.extend(insts)
+
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 

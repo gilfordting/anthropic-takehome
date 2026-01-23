@@ -439,6 +439,128 @@ def batch_localize(name: str, batch: int) -> str:
 # dest: Optional[str] = None,
 # frees: Optional[set[str]] = None,
 
+def calculate_shifts(batch: int) -> list[int]:
+    factor = batch // VLEN
+    shift = 0
+    shifts = []
+    while factor > 0:
+        if factor % 2 == 1:
+            shifts.append(shift)
+        factor //= 2
+        shift += 1
+    return shifts
+
+
+def make_initial_load(
+    curr_addr_name: str, val_name: str, batch: int, round: int
+) -> list[SymbolicBundle]:
+    bundles = []
+    assert batch % VLEN == 0, "batch must be a multiple of VLEN"
+
+    tmp_name = batch_localize("addr_calc_tmp", batch)
+
+    shifts = calculate_shifts(batch)
+    if len(shifts) == 0:
+        bundles.append(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="vload",
+                arg_names=[const("inp_values_p")],
+                dest=val_name,
+            )
+        )
+        return bundles
+
+    first_shift, rest = shifts[0], shifts[1:]
+    single_bundles = [
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="<<",
+            arg_names=[const("1"), const(str(first_shift))],
+            dest=curr_addr_name,
+            comment="first shift",
+        )
+    ]
+    # can do two shifts in parallel on the first cycle
+    if len(rest) > 0:
+        single_bundles.append(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="<<",
+                arg_names=[const("1"), const(str(rest[0]))],
+                dest=tmp_name,
+                comment="first of rest shift",
+            )
+        )
+    bundles.append(multi_bundle(*single_bundles))
+    for shift in rest[1:]:
+        # curr_addr += tmp; tmp = 1 << i
+        bundles.append(
+            multi_bundle(
+                single_bundle(
+                    batch=batch,
+                    round=round,
+                    op="+",
+                    arg_names=[curr_addr_name, tmp_name],
+                    dest=curr_addr_name,
+                    frees={tmp_name},
+                ),
+                single_bundle(
+                    batch=batch,
+                    round=round,
+                    op="<<",
+                    arg_names=[const("1"), const(str(shift))],
+                    dest=tmp_name,
+                ),
+            )
+        )
+    # add tmp, multiply by VLEN, add inp_values_p, and vload
+    if len(rest) > 0:
+        bundles.append(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="+",
+                arg_names=[curr_addr_name, tmp_name],
+                dest=curr_addr_name,
+                frees={tmp_name},
+                comment="1",
+            )
+        )
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="*",
+            arg_names=[curr_addr_name, const("s_vlen")],
+            dest=curr_addr_name,
+            comment="2",
+        )
+    )
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="+",
+            arg_names=[curr_addr_name, const("inp_values_p")],
+            dest=curr_addr_name,
+            comment="3",
+        )
+    )
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="vload",
+            arg_names=[curr_addr_name],
+            dest=val_name,
+            comment="4",
+        )
+    )
+    return bundles
 
 # in_name is provided, and we reuse it for a lot of stuff
 def make_hash(
@@ -687,15 +809,13 @@ def make_wraparound_round(
 
 def make_last_round(
     val_name: str,
-    next_val_name: str,
+    curr_addr_name: str,
     treeval_name: str,
     batch: int,
     round: int,
 ) -> list[SymbolicBundle]:
     bundles = []
     in_last = vector(localize("in_last", batch, round))
-    curr_addr = batch_localize("curr_addr", batch)
-    next_addr = batch_localize("next_addr", batch)
     bundles.append(
         single_bundle(
             batch=batch,
@@ -707,28 +827,19 @@ def make_last_round(
         )
     )
     bundles.extend(make_hash(in_last, val_name, batch, round))
-    single_bundles = [
+    arg_names = [curr_addr_name if batch != 0 else const("inp_values_p"), val_name]
+    frees = {val_name}
+    if batch != 0:
+        frees.add(curr_addr_name)
+    bundles.append(
         single_bundle(
             batch=batch,
             round=round,
             op="vstore",
-            arg_names=[curr_addr, val_name],
-            frees={val_name},
+            arg_names=arg_names,
+            frees=frees,
         )
-    ]
-    # TODO: hardcoded
-    batch_size = 256
-    if batch + VLEN < batch_size:
-        single_bundles.append(
-            single_bundle(
-                batch=batch,
-                round=round,
-                op="vload",
-                arg_names=[next_addr],
-                dest=next_val_name,
-            )
-        )
-    bundles.append(multi_bundle(*single_bundles))
+    )
     return bundles
 
 
@@ -1090,39 +1201,15 @@ class KernelBuilder:
 
         # ---- Main program ----
         bundles = []
-        # Load initial value for first batch; load inp_values_p.
-        # Also need curr_addr and next_addr for each batch
-        curr_addr = batch_localize("curr_addr", 0)
-        next_addr = batch_localize("next_addr", 0)
-        val_name = vector(batch_localize("val", 0))
-        bundles.append(
-            multi_bundle(
-                single_bundle(
-                    op="vload",
-                    arg_names=[const("inp_values_p")],
-                    dest=val_name,
-                ),
-                single_bundle(
-                    op="+",
-                    arg_names=[const("inp_values_p"), const("0")],
-                    dest=curr_addr,
-                ),
-                single_bundle(
-                    op="+",
-                    arg_names=[const("inp_values_p"), const("s_vlen")],
-                    dest=next_addr,
-                ),
-            )
-        )
 
         for batch in range(0, batch_size, VLEN):
-            curr_addr = batch_localize("curr_addr", batch)
-            next_addr = batch_localize("next_addr", batch)
-
+            curr_addr_name = batch_localize("curr_addr", batch)
             val_name = vector(batch_localize("val", batch))
             idx_name = vector(batch_localize("idx", batch))
             treeval_name = vector(batch_localize("treeval", batch))
-            next_val_name = vector(batch_localize("val", batch + VLEN))
+
+            # Load initial value for first batch; load inp_values_p.
+            bundles.extend(make_initial_load(curr_addr_name, val_name, batch, 0))
             for round in range(rounds):
                 # round 0
                 if round % (forest_height + 1) == 0:
@@ -1146,7 +1233,7 @@ class KernelBuilder:
                     bundles.extend(
                         make_last_round(
                             val_name,
-                            next_val_name,
+                            curr_addr_name,
                             treeval_name,
                             batch,
                             round,
@@ -1158,27 +1245,6 @@ class KernelBuilder:
                             val_name, idx_name, treeval_name, batch, round, rounds
                         )
                     )
-
-            # Add in the curr_addr and next_addr for each batch
-            bundles.append(
-                multi_bundle(
-                    single_bundle(
-                        batch=batch,
-                        op="+",
-                        arg_names=[curr_addr, const("s_vlen")],
-                        dest=batch_localize("curr_addr", batch + VLEN),
-                        frees={curr_addr},
-                        comment="i am here",
-                    ),
-                    single_bundle(
-                        batch=batch,
-                        op="+",
-                        arg_names=[next_addr, const("s_vlen")],
-                        dest=batch_localize("next_addr", batch + VLEN),
-                        frees={next_addr},
-                    ),
-                )
-            )
         prog = SymbolicProgram(bundles)
         self.instrs.extend(
             prog.to_concrete({}, scalar_freelist, vector_freelist, consts)

@@ -368,3 +368,38 @@ vector offset is allowed for:
 
 - reading from a vector, for scalar alu
 - loading to a vector, for scalar load
+
+### First address calc
+
+there are 32 possible batches
+biggest one at 31 \* 8
+or, 0b11111 \* 8
+or, 0b11111000
+all an individual SIMD lane needs is:
+constants 1 through 5
+curr_addr register
+tmp register
+
+curr_addr = 0
+for i in shifts_needed:
+  tmp = 1 << i
+  curr_addr += tmp
+curr_addr \*= VLEN
+curr_addr += inp_values_p
+vload curr_addr
+
+this can be overlapped with other stuff
+length of shifts needed is = popcount
+so batches 0, 1, 2, 4, 8, 16 will be ready to be scheduled first
+
+this way, we can make 32 fully independent instruction streams
+
+shifts_needed
+
+TODO:
+check the number of scalar registers
+
+- we need one for curr_addr
+- and one for tmp in the initial section
+- tmp_addr for gather
+make_last_round; function signature was changed so change invocation

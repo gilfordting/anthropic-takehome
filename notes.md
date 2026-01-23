@@ -224,10 +224,10 @@ round 2+:
 parity = val % 2
 idx = idx + parity
 treeval = gather(idx)
+we free idx if the next round is the wraparound round
 
 wraparound round:
 val = hash(val ^ treeval)
-don't need to set idx or treeval, hardcoded in r0
 
 last round:
 val = hash(val, treeval)
@@ -250,53 +250,51 @@ val = load from addr (TODO??); define val
 R0 = R0 + const
 
 round 0:
-T0 = val ^ tree0_const; define T0; free val
-val = hash(T0); define val; free T0
-V0 = val % 2; define V0 (parity)
-@parallel; free V0; define idx, treeval
-  idx = 1 + V0
-  treeval = V0 \* (v2-v1) + v1
+in0 = val ^ const vtreeval0; free val
+val = hash(in0)
+parity0 = val % 2; no free, needs to persist to next iter
+@parallel
+  idx = parity0 + v1; free parity0
+  treeval = parity0 \* vdiff21 + vtreeval1; free parity0
 
 round 1:
-T1 = val ^ treeval; define T1; free val, treeval
-@parallel; define val; free T1
-  val = hash(T1)
-  idx = 2*idx + 1  # no change, use same register
+in1 = val ^ treeval; free val, treeval
+val = hash(in1); free in1
+idx = 2*idx + 1  # no change, use same register
 
-@parallel; define V1 (parity), V2 (tmpidx/upper bit)
-  V1 = val % 2
-  V2 = idx - 3
+@parallel
+  parity1 = val % v2
+  upperbit1 = idx - v3
   
-@parallel; free V1; define D1, D2
-  D1 = V1 \* (v4-v3) + v3
-  D2 = V1 \* (v6-v5) + v5
-  idx = idx + V1  # this is final
+@parallel
+  diff1 = parity1 \* vdiff43 + vtreeval3; free parity1
+  diff2 = parity1 \* vdiff65 + vtreeval5; free parity1
+  idx = idx + parity1; free parity1
   
-@parallel; free D2; define ddiff
-  ddiff = D2 - D1
-  V2 = V2 >> 1
+@parallel
+  ddiff = diff2 - diff1; free diff2
+  upperbit1 = upperbit1 >> v1
 
-treeval = V2 \* ddiff + D1; define treeval; free V2, ddiff, D1
-
-round 2+:
-T2 = val ^ treeval; define T2; free val, treeval
-@parallel; define val; free T2
-  val = hash(T2)
-  idx = 2*idx + 1
-
-V3 = val % 2; define V3 (parity)
-idx = idx + V3; free V3
-treeval = gather(idx); define treeval; free idx (only if next round is wraparound)
+treeval = upperbit1 \* ddiff + diff1; free upperbit1, ddiff, diff1
 
 wraparound round:
-Twrap = val ^ treeval; define Twrap; free val, treeval
-val = hash(Twrap); define val; free Twrap
+in_wrap = val ^ treeval; free val, treeval
+val = hash(in_wrap)
 
 last round:
-Tlast = val ^ treeval; free val, treeval
-val = hash(Tlast); define val; free Tlast
-store val; free val
-load init val for next batch; define val
+in_last = val ^ treeval; free val, treeval
+val = hash(in_last)
+vstore curr_addr, val; free curr_addr, val
+vload next_val, next_addr; free next_addr
+
+round 2+:
+inX = val ^ treeval; free val, treeval
+val = hash(inX)
+@parallel
+  parityX = val % v2
+  idx = 2*idx + 1
+idx = idx + parityX; free parityX
+treeval = gather(idx); define treeval; free idx but only if next round is wraparound
 
 hash:
 in is x
@@ -354,3 +352,18 @@ Got it down to 11 cycles.
 ### Register renaming
 
 goal: simply allocate a pool of vector registers, and a pool of scalar registers. then all we have to is define a symbolic program with infinite registers, and the system handles regalloc to physical registers.
+
+Game plan: rewrite the kernel in this symbolic language, and see if it's correct. Then we can proceed to static computation graph + VLIW scheduler.
+
+#### Conventions for variable names
+
+- vector registers start with `v`
+- constant names start with `const_`
+- ops can uniquely determine engine
+
+Assume val, tmp_addr, idx, treeval already have localized names
+
+vector offset is allowed for:
+
+- reading from a vector, for scalar alu
+- loading to a vector, for scalar load

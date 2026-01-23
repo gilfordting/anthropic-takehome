@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Any, Literal
 import random
 
-Engine = Literal["alu", "load", "store", "flow"]
+Engine = Literal["alu", "valu", "load", "store", "flow"]
 Instruction = dict[Engine, list[tuple]]
 
 
@@ -482,6 +482,7 @@ def reference_kernel(t: Tree, inp: Input):
             idx = 0 if idx >= len(t.values) else idx
             inp.values[i] = val
             inp.indices[i] = idx
+
 
 def reference_kernel_simplified(t: Tree, inp: Input):
     for i in range(len(inp.indices)):

@@ -37,51 +37,17 @@ from problem import (
 )
 
 
-class KernelBlock:
-    def __init__(self):
-        self.instrs = []
-
-    def add_bundle(self, **kwargs):
-        vliw_inst = {
-            "alu": kwargs.get("alu", []),
-            "valu": kwargs.get("valu", []),
-            "load": kwargs.get("load", []),
-            "store": kwargs.get("store", []),
-            "flow": kwargs.get("flow", []),
-            "debug": kwargs.get("debug", []),
-        }
-        self.instrs.append(vliw_inst)
-
-    def append_block(self, other: "KernelBlock"):
-        self.instrs.extend(other.instrs)
-
-    # Hijack the first instruction in the block; add the given slots.
-    def hijack_first(self, **kwargs):
-        for engine in ("alu", "valu", "load", "store", "flow", "debug"):
-            if engine in kwargs:
-                self.instrs[0][engine].extend(kwargs[engine])
-            assert len(self.instrs[0][engine]) <= SLOT_LIMITS[engine], (
-                "Hijacking exceeded slot limit"
-            )
-
-    def interleave(self, other: "KernelBlock") -> "KernelBlock":
-        assert len(self.instrs) == len(other.instrs), (
-            "Blocks must have the same number of instructions"
-        )
-        block = KernelBlock()
-        for i in range(len(self.instrs)):
-            merged_instr = defaultdict(list)
-            for engine in ("alu", "valu", "load", "store", "flow", "debug"):
-                merged_instr[engine].extend(self.instrs[i][engine])
-                merged_instr[engine].extend(other.instrs[i][engine])
-            block.instrs.append(merged_instr)
-        return block
+CONST_PREFIX = "const "
+VECTOR_PREFIX = "v"
 
 
 # Symbolic structures use names, instead of concrete registers.
 # We can safely instantiate one of these like val = val + 1 and it will automatically add `val` to `frees`, triggering behavior to use different registers.
-@dataclass(frozen=True)
+# Semantically, we allocate new registers for dest as a separate mapping, free registers and remove from current mapping, then merge in dest mappings into current mapping.
+@dataclass
 class SymbolicInstructionSlot:
+    batch: int
+    round: int
     engine: Engine
     op: str
     # dependencies are all here, minus ones that start with "const_"
@@ -89,52 +55,172 @@ class SymbolicInstructionSlot:
     # same role as `defines`, but explicitly separated from arg list
     dest: Optional[str] = None
     # always frees these, and adds them to freelist
-    frees: Optional[frozenset[str]] = None
+    frees: Optional[set[str]] = None
+    # this is used to offset into a vector reg, if defined
+    vector_offsets: Optional[dict[str, int]] = None
+    comment: str = None
+
+    def is_vector_var(self, name: str) -> bool:
+        if name.startswith(VECTOR_PREFIX):
+            return name not in self.vector_offsets  # this will turn it into a scalar
+        return name.startswith(CONST_PREFIX) and name[len(CONST_PREFIX) :].startswith(
+            VECTOR_PREFIX
+        )
 
     def __post_init__(self):
         if self.frees is None:
             self.frees = set()
+        if self.vector_offsets is None:
+            self.vector_offsets = {}
         # If `dest` reuses a symbolic register, use different registers for input and output.
         # In order to trigger this behavior, add `dest` to `frees` if not already present.
         if self.dest is not None and self.dest in self.arg_names:
             self.frees.add(self.dest)
         # you can't free constant registers
-        assert all(not name.startswith("const_") for name in self.frees), (
+        assert all(not name.startswith(CONST_PREFIX) for name in self.frees), (
             "cannot free constant registers"
         )
         # and you can only free registers you actually used
         assert all(reg in self.arg_names for reg in self.frees), (
-            "cannot free registers you didn't use"
+            "cannot free registers you didn't use; got: "
+            + ", ".join(self.frees)
+            + " but only have: "
+            + ", ".join(self.arg_names)
+        )
+        # vector_offsets must specify for actually present things
+        assert all(
+            name in self.arg_names or name == self.dest for name in self.vector_offsets
+        )
+        # vector offsets must be 0 to 7
+        assert all(0 <= offset < VLEN for offset in self.vector_offsets.values()), (
+            "vector offsets must be 0 to 7"
         )
 
+        # check that all vector slots get vector arguments/destinations
+        operands = self.arg_names
+        match self.engine:
+            case "alu":
+                if self.dest is not None:
+                    operands += (self.dest,)
+                assert len(operands) == 3, "alu must have 2 arguments and 1 destination"
+                assert all(not self.is_vector_var(name) for name in operands), (
+                    "alu arguments/destinations must be scalar, instead got: "
+                    + ", ".join(operands)
+                )
+            case "valu":
+                if self.dest is not None:
+                    operands += (self.dest,)
+                if self.op == "multiply_add":
+                    assert len(operands) == 4, (
+                        "multiply_add must have 3 arguments and 1 destination"
+                    )
+                else:
+                    assert len(operands) == 3, (
+                        "valu must have 2 arguments and 1 destination; got: "
+                        + ", ".join(operands)
+                        + " for op: "
+                        + self.op
+                    )
+                assert all(self.is_vector_var(name) for name in operands), (
+                    "valu arguments/destinations must be vector, instead got: "
+                    + ", ".join(operands)
+                )
+            case "load":
+                assert len(operands) == 1, "load must have 1 address"
+                assert all(not self.is_vector_var(name) for name in operands), (
+                    "load arg must be a scalar address"
+                )
+                assert self.dest is not None, "load must have a destination"
+                assert self.is_vector_var(self.dest) == self.is_vector, (
+                    "load type must match destination type"
+                )
+            case "store":
+                assert len(operands) == 2, (
+                    "store must have 2 arguments: value and address"
+                )
+                assert not self.is_vector_var(operands[0]), (
+                    "store address must be scalar"
+                )
+                assert self.is_vector_var(operands[1]) == self.is_vector, (
+                    "store value must match destination type"
+                )
+
     def to_concrete(
-        self, in_mapping: dict[str, int], out_mapping: dict[str, int]
+        self,
+        in_mapping: dict[str, int],
+        out_mapping: dict[str, int],
+        consts: dict[str, int],
     ) -> (Engine, tuple):
-        # check that all args are in the mapping
-        assert all(name in in_mapping for name in self.arg_names), (
-            "arguments not in mapping"
-        )
-        full_args = [in_mapping[name] for name in self.arg_names]
-        # check that dest in mapping
+        # Used for inputs. Will throw error if mapping not found.
+        def name_to_reg(name: str, mapping: dict[str, int]):
+            if name.startswith(CONST_PREFIX):
+                return consts[name[len(CONST_PREFIX) :]]
+            assert name in mapping, (
+                f"name {name} not found in mapping for round {self.round} and batch {self.batch}; comment: {self.comment};"
+            )
+
+            reg = mapping[name]
+            if name in self.vector_offsets:
+                reg += self.vector_offsets[name]
+            assert reg < 1536, (
+                "register is out of bounds; name is: "
+                + name
+                + "; reg is: "
+                + str(reg)
+                + "vector offsets: "
+                + str(self.vector_offsets[name])
+            )
+            return reg
+
+        full_args = [name_to_reg(name, in_mapping) for name in self.arg_names]
         if self.dest is not None:
-            assert self.dest in out_mapping, "non-None dest not in output mapping"
-            full_args = [out_mapping[self.dest]] + full_args
+            full_args = [name_to_reg(self.dest, out_mapping)] + full_args
         return self.engine, (self.op, *full_args)
+
+    @property
+    def is_vector(self) -> bool:
+        match self.engine:
+            case "alu":
+                return False
+            case "valu":
+                return True
+            case "load":
+                return self.op == "vload"
+            case "store":
+                return self.op == "vstore"
+            case "flow":
+                return self.op == "vselect"
+            case "debug":
+                return False
+            case _:
+                assert False, "invalid engine; got: " + self.engine
+
+    @property
+    def is_scalar(self) -> bool:
+        return not self.is_vector
 
 
 def make_slot(
+    batch: int,
+    round: int,
     engine: Engine,
     op: str,
     arg_names: list[str],
     dest: Optional[str] = None,
     frees: Optional[set[str]] = None,
+    vector_offsets: Optional[dict[str, int]] = None,
+    comment: str = None,
 ) -> SymbolicInstructionSlot:
     return SymbolicInstructionSlot(
+        batch=batch,
+        round=round,
         engine=engine,
         op=op,
         dest=dest,
         arg_names=tuple(arg_names),
-        frees=frozenset(frees) if frees is not None else None,
+        frees=frees,
+        vector_offsets=vector_offsets,
+        comment=comment,
     )
 
 
@@ -147,46 +233,198 @@ class SymbolicBundle:
         dests = [slot.dest for slot in self.slots if slot.dest is not None]
         assert len(dests) == len(set(dests)), "destination names must be unique"
 
-    def to_concrete(self, using: dict[str, int], freelist: set[int]) -> Instruction:
+    def to_concrete(
+        self,
+        using: dict[str, int],
+        scalar_freelist: set[int],
+        vector_freelist: set[int],
+        consts: dict[str, int],
+    ) -> Instruction:
         # make the out mapping: take stuff from freelist and use it for destinations
-        out_mapping = {
-            slot.dest: freelist.pop() for slot in self.slots if slot.dest is not None
-        }
+        # also keep track of which slot it came from
+        out_mapping = {}
+        for i, slot in enumerate(self.slots):
+            if slot.dest is not None:
+                # Must make this compatible with vector offsets
+                if slot.dest in slot.vector_offsets:
+                    assert slot.op == "load", (
+                        "vector offsets can only be used with load dest"
+                    )
+                    # If loading to a vector offset, we don't load to a new register.
+                    # We must use an existing register.
+                    assert slot.dest in using, (
+                        "If loading to vector offset, dest must already exist"
+                    )
+                    out_mapping[slot.dest] = (
+                        using[slot.dest],
+                        i,
+                    )
+                    continue
+                freelist = scalar_freelist if slot.is_scalar else vector_freelist
+                assert len(freelist) > 0, (
+                    f"freelist is empty for slot {i}, which is batch {slot.batch} and round {slot.round}; it is scalar: {slot.is_scalar}"
+                )
+
+                out_mapping[slot.dest] = (freelist.pop(), i)
+        assert all(reg < 1536 for reg, _ in out_mapping.values()), (
+            "register is out of bounds"
+        )
+        assert all(reg < 1536 for reg in using.values()), (
+            "using register is out of bounds"
+        )
+        # entire instruction
         inst = defaultdict(list)
         for slot in self.slots:
-            engine, args = slot.to_concrete(using, out_mapping)
+            engine, args = slot.to_concrete(
+                using, {name: reg for name, (reg, _) in out_mapping.items()}, consts
+            )
             inst[engine].append(args)
-        # after this, we can safely free registers; aggregate first so we don't try to free the same name twice
+
+        # after this, we can safely free registers; aggregate first so we don't try to free the same name twice, though
+        # get the set of all freed variables
         all_frees = set()
         for slot in self.slots:
-            all_frees |= slot.frees
+            if slot.frees is not None:
+                all_frees |= slot.frees
         # check that all the registers we're trying to free are actually available to be freed
         assert all(name in using for name in all_frees), (
             "cannot free registers that are not available"
         )
-        freelist |= {using.pop(name) for name in all_frees}
+        for name in all_frees:
+            assert not name.startswith(CONST_PREFIX), "cannot free constant registers"
+            if name.startswith(VECTOR_PREFIX):
+                assert using[name] + 7 < 1536, "vector register is out of bounds"
+                vector_freelist.add(using.pop(name))
+            else:
+                assert using[name] < 1536, "scalar register is out of bounds"
+                scalar_freelist.add(using.pop(name))
 
         # check that we have a valid instruction
         for engine in inst:
             assert len(inst[engine]) <= SLOT_LIMITS[engine], (
-                "instruction exceeded slot limit"
+                f"engine {engine} exceeded slot limit"
             )
+
+        for name, (reg, src_slot_i) in out_mapping.items():
+            # if we are loading to vector offset, should not redefine dest; it already exists
+            if name in self.slots[src_slot_i].vector_offsets:
+                continue
+            assert name not in using, (
+                f"variable {name} is being redefined, in round {self.slots[src_slot_i].round} and batch {self.slots[src_slot_i].batch}"
+            )
+            using[name] = reg
 
         return inst
 
 
+@dataclass
+class SymbolicProgram:
+    bundles: list[SymbolicBundle]
+
+    def to_concrete(
+        self,
+        using: dict[str, int],
+        scalar_freelist: set[int],
+        vector_freelist: set[int],
+        consts: dict[str, int],
+    ) -> list[Instruction]:
+        return [
+            bundle.to_concrete(using, scalar_freelist, vector_freelist, consts)
+            for bundle in self.bundles
+        ]
+
+
+def infer_engine(op: str) -> Engine:
+    engine = None
+    if "load" in op or "const" in op:
+        engine = "load"
+    elif "store" in op:
+        engine = "store"
+    elif op in ("+", "-", "*", "//", "cdiv", "^", "&", "|", "<<", ">>", "%", "<", "=="):
+        engine = "alu"
+    elif op == "multiply_add":
+        engine = "valu"
+    elif "valu" in op:
+        engine = "valu"
+        op = op[4:]
+    elif op in (
+        "select",
+        "add_imm",
+        "vselect",
+        "halt",
+        "pause",
+        "trace_write",
+        "cond_jump",
+        "cond_jump_rel",
+        "jump",
+        "jump_indirect",
+        "coreid",
+    ):
+        engine = "flow"
+    else:
+        engine = "debug"
+
+    return engine, op
+
+
+# Makes a single bundle (1 VLIW instruction) that has a single occupied slot.
+# Use this factory for everything. Will infer engine from name.
 def single_bundle(
-    engine: Engine,
     op: str,
     arg_names: list[str],
     dest: Optional[str] = None,
     frees: Optional[set[str]] = None,
+    vector_offsets: Optional[dict[str, int]] = None,
+    batch: int = None,
+    round: int = None,
+    comment: str = None,
 ) -> SymbolicBundle:
-    return SymbolicBundle(slots=[make_slot(engine, op, arg_names, dest, frees)])
+    engine, op = infer_engine(op)
+    return SymbolicBundle(
+        slots=[
+            make_slot(
+                batch,
+                round,
+                engine,
+                op,
+                arg_names,
+                dest,
+                frees,
+                vector_offsets,
+                comment,
+            )
+        ]
+    )
 
 
+# Makes a single bundle that has multiple occupied slots. This merges multiple bundles together.
 def multi_bundle(*args: SymbolicBundle) -> SymbolicBundle:
     return SymbolicBundle(slots=sum([bundle.slots for bundle in args], []))
+
+
+def const(name: str) -> str:
+    return f"{CONST_PREFIX}{name}"
+
+
+def vector(name: str) -> str:
+    return f"{VECTOR_PREFIX}{name}"
+
+
+# localize a name to a batch and round
+def localize(name: str, batch: int, round: int) -> str:
+    return f"{name}_{batch}_{round}"
+
+
+def batch_localize(name: str, batch: int) -> str:
+    return f"{name}_{batch}"
+
+
+# all symbolic instructions needs to provide this info
+# if a name is used for dest, does not need to be provided in `frees`
+# op: str,
+# arg_names: list[str],
+# dest: Optional[str] = None,
+# frees: Optional[set[str]] = None,
 
 
 # in_name is provided, and we reuse it for a lot of stuff
@@ -195,49 +433,397 @@ def make_hash(
 ) -> list[SymbolicBundle]:
     bundles = []
     curr = in_name
-    for i, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-        # (curr op1 val1) op2 (curr op3 val3)
+    # looks like:
+    # valu: multiply_add, curr, curr, const vhash_mult0, const vhash_add0
+    # @parallel
+    #   valu: op1, tmp1, curr, const vhash_add0; frees: curr
+    #   valu: op3, tmp2, curr, const vhash_mult0; frees: curr
+    # valu: op2, curr, tmp1, tmp2; frees: tmp1, tmp2
+    # ...
+    # valu: op2, out_name, tmp1, tmp2; frees: tmp1, tmp2
+
+    for i, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
+        op1, op2, op3 = (f"valu{op}" for op in (op1, op2, op3))
         if i in (0, 2, 4):
             bundles.append(
                 single_bundle(
-                    engine="valu",
+                    batch=batch,
+                    round=round,
                     op="multiply_add",
-                    arg_names=[curr, f"const_hash_multiply_{i}", f"const_hash_add_{i}"],
+                    arg_names=[
+                        curr,
+                        const(f"vhash_mult{i}"),
+                        const(f"vhash_add{i}"),
+                    ],
                     dest=curr,
                 )
             )
             continue
-        tmp1 = f"hash_tmp1_{i}_{batch}_{round}"
-        tmp2 = f"hash_tmp2_{i}_{batch}_{round}"
+        tmp1 = vector(localize(f"hash_tmp1_{i}", batch, round))
+        tmp2 = vector(localize(f"hash_tmp2_{i}", batch, round))
         bundles.append(
             multi_bundle(
                 single_bundle(
-                    engine="valu",
+                    batch=batch,
+                    round=round,
                     op=op1,
-                    arg_names=[curr, f"const_hash_add_{i}"],
+                    arg_names=[curr, const(f"vhash_add{i}")],
                     dest=tmp1,
                     frees={curr},
                 ),
                 single_bundle(
-                    engine="valu",
+                    batch=batch,
+                    round=round,
                     op=op3,
-                    arg_names=[curr, f"const_hash_multiply_{i}"],
+                    arg_names=[curr, const(f"vhash_mult{i}")],
                     dest=tmp2,
                     frees={curr},
                 ),
             )
         )
-        if i == 5:
+        if i == len(HASH_STAGES) - 1:
             curr = out_name
         bundles.append(
             single_bundle(
-                engine="valu",
+                batch=batch,
+                round=round,
                 op=op2,
                 arg_names=[tmp1, tmp2],
                 dest=curr,
                 frees={tmp1, tmp2},
             )
         )
+    return bundles
+
+
+def make_round0(
+    val_name: str, idx_name: str, treeval_name: str, batch: int, round: int
+) -> list[SymbolicBundle]:
+    bundles = []
+    in0 = vector(localize("in0", batch, round))
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="valu^",
+            arg_names=[val_name, const("vtreeval0")],
+            dest=in0,
+            frees={val_name},
+        )
+    )
+    bundles.extend(make_hash(in0, val_name, batch, round))
+    parity0 = vector(localize("parity0", batch, round))
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="valu%",
+            arg_names=[val_name, const("v2")],
+            dest=parity0,
+        )
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu+",
+                arg_names=[parity0, const("v1")],
+                dest=idx_name,
+                frees={parity0},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[parity0, const("vdiff21"), const("vtreeval1")],
+                dest=treeval_name,
+                frees={parity0},
+            ),
+        )
+    )
+    return bundles
+
+
+def make_round1(
+    val_name: str, idx_name: str, treeval_name: str, batch: int, round: int
+) -> list[SymbolicBundle]:
+    bundles = []
+    in1 = vector(localize("in1", batch, round))
+    parity1 = vector(localize("parity1", batch, round))
+    upperbit1 = vector(localize("upperbit1", batch, round))
+    diff1 = vector(localize("diff1", batch, round))
+    diff2 = vector(localize("diff2", batch, round))
+    ddiff = vector(localize("ddiff", batch, round))
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="valu^",
+            arg_names=[val_name, treeval_name],
+            dest=in1,
+            frees={val_name, treeval_name},
+        )
+    )
+    bundles.extend(make_hash(in1, val_name, batch, round))
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="multiply_add",
+            arg_names=[const("v2"), idx_name, const("v1")],
+            dest=idx_name,
+        )
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu%",
+                arg_names=[val_name, const("v2")],
+                dest=parity1,
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu-",
+                arg_names=[idx_name, const("v3")],
+                dest=upperbit1,
+            ),
+        )
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[parity1, const("vdiff43"), const("vtreeval3")],
+                dest=diff1,
+                frees={parity1},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[parity1, const("vdiff65"), const("vtreeval5")],
+                dest=diff2,
+                frees={parity1},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu+",
+                arg_names=[idx_name, parity1],
+                dest=idx_name,
+                frees={parity1},
+            ),
+        )
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu-",
+                arg_names=[diff2, diff1],
+                dest=ddiff,
+                frees={diff2},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu>>",
+                arg_names=[upperbit1, const("v1")],
+                dest=upperbit1,
+            ),
+        )
+    )
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="multiply_add",
+            arg_names=[upperbit1, ddiff, diff1],
+            dest=treeval_name,
+            frees={upperbit1, ddiff, diff1},
+        )
+    )
+    return bundles
+
+
+def make_wraparound_round(
+    val_name: str, idx_name: str, treeval_name: str, batch: int, round: int
+) -> list[SymbolicBundle]:
+    bundles = []
+    in_wrap = vector(localize("in_wrap", batch, round))
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="valu^",
+            arg_names=[val_name, treeval_name],
+            dest=in_wrap,
+            frees={val_name, treeval_name},
+        )
+    )
+    bundles.extend(make_hash(in_wrap, val_name, batch, round))
+    return bundles
+
+
+def make_last_round(
+    val_name: str,
+    next_val_name: str,
+    treeval_name: str,
+    batch: int,
+    round: int,
+) -> list[SymbolicBundle]:
+    bundles = []
+    in_last = vector(localize("in_last", batch, round))
+    curr_addr = batch_localize("curr_addr", batch)
+    next_addr = batch_localize("next_addr", batch)
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="valu^",
+            arg_names=[val_name, treeval_name],
+            dest=in_last,
+            frees={val_name, treeval_name},
+        )
+    )
+    bundles.extend(make_hash(in_last, val_name, batch, round))
+    single_bundles = [
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="vstore",
+            arg_names=[curr_addr, val_name],
+            frees={val_name},
+        )
+    ]
+    # TODO: hardcoded
+    batch_size = 256
+    if batch + VLEN < batch_size:
+        single_bundles.append(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="vload",
+                arg_names=[next_addr],
+                dest=next_val_name,
+            )
+        )
+    bundles.append(multi_bundle(*single_bundles))
+    return bundles
+
+
+def make_mid_round(
+    val_name: str,
+    idx_name: str,
+    treeval_name: str,
+    batch: int,
+    round: int,
+) -> list[SymbolicBundle]:
+    bundles = []
+    inX = vector(localize("inX", batch, round))
+    parityX = vector(localize("parityX", batch, round))
+    # this is a scalar register!
+    tmp_addr = batch_localize("tmp_addr", batch)
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="valu^",
+            arg_names=[val_name, treeval_name],
+            dest=inX,
+            frees={val_name},
+        )
+    )
+    bundles.extend(make_hash(inX, val_name, batch, round))
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu%",
+                arg_names=[val_name, const("v2")],
+                dest=parityX,
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[const("v2"), idx_name, const("v1")],
+                dest=idx_name,
+            ),
+        )
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu+",
+                arg_names=[idx_name, parityX],
+                dest=idx_name,
+                frees={parityX},
+            ),
+        )
+    )
+    # gather
+    # first, calc address: forest_values_p + idx[0]
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="+",
+            arg_names=[const("forest_values_p"), idx_name],
+            dest=tmp_addr,
+            vector_offsets={idx_name: 0},
+        )
+    )
+    # if next round is wraparound, free idx
+    forest_height = 10
+    for i in range(1, VLEN):
+        frees = set()
+        if (round + 2) % (forest_height + 1) == 0 and i == VLEN - 1:
+            frees = {idx_name}
+        bundles.append(
+            multi_bundle(
+                single_bundle(
+                    batch=batch,
+                    round=round,
+                    op="+",
+                    arg_names=[const("forest_values_p"), idx_name],
+                    dest=tmp_addr,
+                    vector_offsets={idx_name: i},
+                    frees=frees,
+                ),
+                # Load from tmp_addr into offset vector reg
+                single_bundle(
+                    batch=batch,
+                    round=round,
+                    op="load",
+                    arg_names=[tmp_addr],
+                    dest=treeval_name,
+                    vector_offsets={treeval_name: i - 1},
+                    frees={tmp_addr},
+                ),
+            )
+        )
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="load",
+            arg_names=[tmp_addr],
+            dest=treeval_name,
+            vector_offsets={treeval_name: VLEN - 1},
+            frees={tmp_addr},
+        )
+    )
     return bundles
 
 
@@ -252,7 +838,7 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def add_bundle(self, **kwargs):
+    def make_bundle(self, **kwargs):
         vliw_inst = {
             "alu": kwargs.get("alu", []),
             "valu": kwargs.get("valu", []),
@@ -264,12 +850,14 @@ class KernelBuilder:
         assert all(
             len(vliw_inst[engine]) <= SLOT_LIMITS[engine] for engine in vliw_inst
         ), "instruction exceeded slot limit"
-        self.instrs.append(vliw_inst)
+        return vliw_inst
 
-    def add_bundle_list(self, vliw_insts: list[Instruction]):
-        self.instrs.extend(vliw_insts)
+    def add_bundle(self, **kwargs):
+        self.instrs.append(self.make_bundle(**kwargs))
 
+    # This uses an entire cycle.
     def add(self, engine, slot):
+        assert engine in ("flow", "debug"), "only flow and debug can be entire cycles"
         self.instrs.append({engine: [slot]})
 
     def alloc_scratch(self, name=None, length=1):
@@ -280,492 +868,6 @@ class KernelBuilder:
         self.scratch_ptr += length
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
-
-    def scratch_const(self, val, name=None):
-        if val not in self.const_map:
-            addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
-            self.const_map[val] = addr
-        return self.const_map[val]
-
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(
-                ("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi)))
-            )
-
-        return slots
-
-    def build_kernel_ref(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
-        """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
-        """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
-
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
-
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
-
-        body = []  # array of slots
-
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
-
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                )
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
-                )
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(
-                    ("debug", ("compare", tmp_node_val, (round, i, "node_val")))
-                )
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                )
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("store", ("store", tmp_addr, tmp_val)))
-
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
-
-    def build_kernel_draft1(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
-        # ---- Global constants ----
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        _ = self.alloc_scratch()  # Alignment
-        # There are 8 of these, so we can just do a vectorized load once we have a 0 to work with
-        zero_const, one_const, two_const, three_const = (
-            self.scratch_const(i) for i in range(4)
-        )
-        # This loads our variables from constant mem into scratch space
-        # TODO: bundleize adds, scratch_const, etc. (anything not alloc_scratch)
-        self.add("load", ("vload", 0, zero_const))
-
-        # ---- Constants ----
-        vlen_const, vlen2_const, vlen3_const = [
-            self.scratch_const((i + 1) * VLEN) for i in range(3)
-        ]
-        vconst0, vconst1, vconst2, vconst3 = (
-            self.alloc_scratch(f"vconst{i}", VLEN) for i in range(4)
-        )
-        self.add_bundle(
-            valu=[
-                ("vbroadcast", vconst0, zero_const),
-                ("vbroadcast", vconst1, one_const),
-                ("vbroadcast", vconst2, two_const),
-                ("vbroadcast", vconst3, three_const),
-            ],
-        )
-
-        # Hash constants
-        hash_add_consts, vhash_add_consts = {}, {}
-        hash_shift_consts, vhash_shift_consts = {}, {}
-        broadcast_slots = []
-        for i in range(len(HASH_STAGES)):
-            _, const, _, _, shift = HASH_STAGES[i]
-            hash_add_consts[i] = self.scratch_const(const)
-            hash_shift_consts[i] = self.scratch_const(
-                1 + 2**shift if i in (0, 2, 4) else shift
-            )
-            vhash_add_consts[i] = self.alloc_scratch(f"vhash_add_consts{i}", VLEN)
-            vhash_shift_consts[i] = self.alloc_scratch(f"vhash_mult_consts{i}", VLEN)
-            broadcast_slots.extend(
-                [
-                    ("vbroadcast", vhash_add_consts[i], hash_add_consts[i]),
-                    ("vbroadcast", vhash_shift_consts[i], hash_shift_consts[i]),
-                ]
-            )
-        self.add_bundle(valu=broadcast_slots[:6])
-        self.add_bundle(valu=broadcast_slots[6:])
-
-        # Constant diffs for caching + linear interpolation
-        vdiff21_const = self.alloc_scratch("vdiff21_const", VLEN)
-        vdiff43_const = self.alloc_scratch("vdiff43_const", VLEN)
-        vdiff65_const = self.alloc_scratch("vdiff65_const", VLEN)
-
-        # ---- Scratch registers ----
-        # One per batch
-        N_BATCH = 2
-
-        # Addresses
-        tmp_addr1, tmp_addr2, tmp_addr3 = (
-            [self.alloc_scratch(f"tmp_addr{i + 1}_batch{b}") for b in range(N_BATCH)]
-            for i in range(3)
-        )
-        # Vector
-        vidx = [self.alloc_scratch(f"vidx_batch{b}", VLEN) for b in range(N_BATCH)]
-        vtmpidx = [
-            self.alloc_scratch(f"vtmpidx_batch{b}", VLEN) for b in range(N_BATCH)
-        ]
-        vval = [self.alloc_scratch(f"vval_batch{b}", VLEN) for b in range(N_BATCH)]
-        vtreeval = [
-            self.alloc_scratch(f"vtreeval_batch{b}", VLEN) for b in range(N_BATCH)
-        ]
-        vparity = [
-            self.alloc_scratch(f"vparity_batch{b}", VLEN) for b in range(N_BATCH)
-        ]
-        vtmp1, vtmp2, vtmp3 = (
-            [self.alloc_scratch(f"vtmp{i + 1}_batch{b}", VLEN) for b in range(N_BATCH)]
-            for i in range(3)
-        )
-        # Scratch registers for diffs
-        vdiff1, vdiff2 = (
-            [self.alloc_scratch(f"vdiff{i}_batch{b}", VLEN) for b in range(N_BATCH)]
-            for i in range(2)
-        )
-        vddiff = [self.alloc_scratch(f"vddiff_batch{b}", VLEN) for b in range(N_BATCH)]
-
-        # ---- Cache population ----
-
-        # Preload the first 8 forest values
-        vforest_vals_const = [
-            self.alloc_scratch(f"vforest_vals{i}", VLEN) for i in range(VLEN)
-        ]
-        self.add(
-            "load", ("vload", vforest_vals_const[0], self.scratch["forest_values_p"])
-        )
-        self.add_bundle(
-            valu=[
-                ("vbroadcast", vforest_vals_const[i], vforest_vals_const[0] + i)
-                for i in range(VLEN)
-                if i >= VLEN // 2
-            ]
-        )
-        self.add_bundle(
-            valu=[
-                ("vbroadcast", vforest_vals_const[i], vforest_vals_const[0] + i)
-                for i in range(VLEN)
-                if i < VLEN // 2
-            ]
-        )
-        # Precompute differences between tree values
-        self.add_bundle(
-            valu=[
-                ("-", vdiff21_const, vforest_vals_const[2], vforest_vals_const[1]),
-                ("-", vdiff43_const, vforest_vals_const[4], vforest_vals_const[3]),
-                ("-", vdiff65_const, vforest_vals_const[6], vforest_vals_const[5]),
-            ]
-        )
-
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
-
-        # ---- Main program ----
-
-        # TODO: now, let's try two batches at once!
-
-        # Load initial values for first batch.
-        # tmp_addr1 contains current address; used for storing
-        # tmp_addr2 contains next address; used for loading
-        self.add_bundle(
-            alu=[
-                (
-                    "+",
-                    tmp_addr1[0],
-                    self.scratch["inp_values_p"],
-                    zero_const,
-                ),
-                (
-                    "+",
-                    tmp_addr2[0],
-                    self.scratch["inp_values_p"],
-                    vlen2_const,
-                ),
-                ("+", tmp_addr1[1], self.scratch["inp_values_p"], vlen_const),
-                ("+", tmp_addr2[1], self.scratch["inp_values_p"], vlen3_const),
-            ],
-            load=[
-                ("vload", vval[0], self.scratch["inp_values_p"]),
-            ],
-        )
-        self.add_bundle(load=[("vload", vval[1], tmp_addr1[1])])
-
-        block = KernelBlock()  # block of instructions
-
-        def batch_instrs(i_base, i_sub):
-            block = KernelBlock()
-            for round in range(rounds):
-                # Round 0 is special case
-                if round % (forest_height + 1) == 0:
-                    # At the top, we use tree0 for vtreeval
-                    block.add_bundle(
-                        valu=[("^", vval[i_sub], vval[i_sub], vforest_vals_const[0])]
-                    )
-                    block.append_block(
-                        self.vbuild_hash(
-                            vval[i_sub],
-                            vtmp1[i_sub],
-                            vhash_add_consts,
-                            vhash_shift_consts,
-                        )
-                    )
-                    block.add_bundle(valu=[("%", vparity[i_sub], vval[i_sub], vconst2)])
-                    block.add_bundle(
-                        valu=[
-                            ("+", vidx[i_sub], vconst1, vparity[i_sub]),
-                            (
-                                "multiply_add",
-                                vtreeval[i_sub],
-                                vparity[i_sub],
-                                vdiff21_const,
-                                vforest_vals_const[1],
-                            ),
-                        ]
-                    )
-                    continue
-                # Round 1: most complicated
-                if round % (forest_height + 1) == 1:
-                    block.add_bundle(
-                        valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
-                    )
-                    hash_block = self.vbuild_hash(
-                        vval[i_sub],
-                        vtmp1[i_sub],
-                        vhash_add_consts,
-                        vhash_shift_consts,
-                    )
-                    hash_block.hijack_first(
-                        valu=[
-                            ("multiply_add", vidx[i_sub], vconst2, vidx[i_sub], vconst1)
-                        ]
-                    )
-                    block.append_block(hash_block)
-                    # update parity and tmpidx
-                    block.add_bundle(
-                        valu=[
-                            ("%", vparity[i_sub], vval[i_sub], vconst2),
-                            ("-", vtmpidx[i_sub], vidx[i_sub], vconst3),
-                        ]
-                    )
-                    # compute diffs
-                    block.add_bundle(
-                        valu=[
-                            (
-                                "multiply_add",
-                                vdiff1[i_sub],
-                                vparity[i_sub],
-                                vdiff43_const,
-                                vforest_vals_const[3],
-                            ),
-                            (
-                                "multiply_add",
-                                vdiff2[i_sub],
-                                vparity[i_sub],
-                                vdiff65_const,
-                                vforest_vals_const[5],
-                            ),
-                            ("+", vidx[i_sub], vidx[i_sub], vparity[i_sub]),
-                        ]
-                    )
-                    # compute diff of diffs and get higher bit of tmpidx
-                    block.add_bundle(
-                        valu=[
-                            ("-", vddiff[i_sub], vdiff2[i_sub], vdiff1[i_sub]),
-                            (">>", vtmpidx[i_sub], vtmpidx[i_sub], vconst1),
-                        ]
-                    )
-                    block.add_bundle(
-                        valu=[
-                            (
-                                "multiply_add",
-                                vtreeval[i_sub],
-                                vtmpidx[i_sub],
-                                vddiff[i_sub],
-                                vdiff1[i_sub],
-                            )
-                        ]
-                    )
-                    continue
-                # Wraparound round
-                if (round + 1) % (forest_height + 1) == 0:
-                    block.add_bundle(
-                        valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
-                    )
-                    block.append_block(
-                        self.vbuild_hash(
-                            vval[i_sub],
-                            vtmp1[i_sub],
-                            vhash_add_consts,
-                            vhash_shift_consts,
-                        )
-                    )
-                    continue
-                # Last round
-                if round == rounds - 1:
-                    # First do the hashing. But then we don't need to load treeval or change idx or anything.
-                    block.add_bundle(
-                        valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
-                    )
-                    block.append_block(
-                        self.vbuild_hash(
-                            vval[i_sub],
-                            vtmp1[i_sub],
-                            vhash_add_consts,
-                            vhash_shift_consts,
-                        )
-                    )
-                    # tmp_addr1 has current address, used for storing; tmp_addr2 has next address, used for loading; update tmp_addr1 and tmp_addr2
-                    # only issue load if there is more in batch
-                    load_insts = (
-                        [("vload", vval[i_sub], tmp_addr2[i_sub])]
-                        if i_base + 2 * VLEN < batch_size
-                        else []
-                    )
-                    block.add_bundle(
-                        store=[("vstore", tmp_addr1[i_sub], vval[i_sub])],
-                        alu=[
-                            ("+", tmp_addr1[i_sub], tmp_addr1[i_sub], vlen2_const),
-                            ("+", tmp_addr2[i_sub], tmp_addr2[i_sub], vlen2_const),
-                        ],
-                        load=load_insts,
-                    )
-                    continue
-
-                # Round 2+: steady-state
-                block.add_bundle(
-                    valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
-                )
-                hash_block = self.vbuild_hash(
-                    vval[i_sub],
-                    vtmp1[i_sub],
-                    vhash_add_consts,
-                    vhash_shift_consts,
-                )
-                hash_block.hijack_first(
-                    valu=[("multiply_add", vidx[i_sub], vconst2, vidx[i_sub], vconst1)]
-                )
-                block.append_block(hash_block)
-                block.add_bundle(
-                    valu=[
-                        ("%", vparity[i_sub], vval[i_sub], vconst2),
-                    ]
-                )
-                block.add_bundle(valu=[("+", vidx[i_sub], vidx[i_sub], vparity[i_sub])])
-                # Gather using this index; first we need to calculate address
-                block.add_bundle(
-                    alu=[
-                        (
-                            "+",
-                            tmp_addr3[i_sub],
-                            self.scratch["forest_values_p"],
-                            vidx[i_sub],
-                        )
-                    ]
-                )
-                # Then overlap loads with address calc
-                for i_off in range(1, VLEN):
-                    block.add_bundle(
-                        load=[("load", vtreeval[i_sub] + i_off - 1, tmp_addr3[i_sub])],
-                        alu=[
-                            (
-                                "+",
-                                tmp_addr3[i_sub],
-                                self.scratch["forest_values_p"],
-                                vidx[i_sub] + i_off,  # i_off'th element in vector
-                            )
-                        ],
-                    )
-                block.add_bundle(
-                    load=[("load", vtreeval[i_sub] + VLEN - 1, tmp_addr3[i_sub])]
-                )
-            return block
-
-        for i_base in range(0, batch_size, 2 * VLEN):
-            blocks = [batch_instrs(i_base, i_sub) for i_sub in range(2)]
-            block.append_block(blocks[0].interleave(blocks[1]))
-
-        self.instrs.extend(block.instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
 
     def build_const_mapping(self):
         const_mapping = {}
@@ -784,7 +886,7 @@ class KernelBuilder:
 
         num_loads = build_scalar_constants([(str(i), i) for i in range(4)])
         vlen_loads = build_scalar_constants(
-            [(f"vlen{i + 1}", (i + 1) * VLEN) for i in range(3)]
+            [(f"s_vlen{i + 1}", (i + 1) * VLEN) for i in range(3)]
         )
         hash_add_loads = build_scalar_constants(
             [(f"hash_add{i}", imm) for i, (_, imm, _, _, _) in enumerate(HASH_STAGES)]
@@ -929,6 +1031,21 @@ class KernelBuilder:
                 setup_cycle_count += 1
         return const_mapping
 
+    # Make scratch registers. Modifies scratch allocator but does not issue instructions.
+    def make_freelists(self):
+        # Right now, starts at 250. We can go up to 1535.
+        N_SCALAR_REG = 32 * 3  # 3 addr registers for each batch
+        # This means we have 1190 / 8 = 148 vector registers to work with.
+        N_VECTOR_REG = 148
+
+        # Make the freelist. Vector and scalar are separated; we must reconcile this difference.
+        scalar_freelist = set(self.alloc_scratch() for _ in range(N_SCALAR_REG))
+        vector_freelist = set(
+            self.alloc_scratch(length=VLEN) for _ in range(N_VECTOR_REG)
+        )
+
+        return scalar_freelist, vector_freelist
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -936,297 +1053,115 @@ class KernelBuilder:
         # this is only 11 cycles; simpler to just have it fully separate. not much overhead
         consts = self.build_const_mapping()
 
-        # ---- Scratch registers ----
-        # One per batch
-        N_BATCH = 2
+        # make register freelists. this is free
+        scalar_freelist, vector_freelist = self.make_freelists()
+        assert all(reg < 1536 for reg in scalar_freelist), (
+            "scalar register is out of bounds"
+        )
+        assert all(reg < 1536 for reg in vector_freelist), (
+            "vector register is out of bounds"
+        )
 
-        # Addresses
-        tmp_addr1, tmp_addr2, tmp_addr3 = (
-            [self.alloc_scratch(f"tmp_addr{i + 1}_batch{b}") for b in range(N_BATCH)]
-            for i in range(3)
-        )
-        # Vector
-        vidx = [self.alloc_scratch(f"vidx_batch{b}", VLEN) for b in range(N_BATCH)]
-        vtmpidx = [
-            self.alloc_scratch(f"vtmpidx_batch{b}", VLEN) for b in range(N_BATCH)
-        ]
-        vval = [self.alloc_scratch(f"vval_batch{b}", VLEN) for b in range(N_BATCH)]
-        vtreeval = [
-            self.alloc_scratch(f"vtreeval_batch{b}", VLEN) for b in range(N_BATCH)
-        ]
-        vparity = [
-            self.alloc_scratch(f"vparity_batch{b}", VLEN) for b in range(N_BATCH)
-        ]
-        vtmp1, vtmp2, vtmp3 = (
-            [self.alloc_scratch(f"vtmp{i + 1}_batch{b}", VLEN) for b in range(N_BATCH)]
-            for i in range(3)
-        )
-        # Scratch registers for diffs
-        vdiff1, vdiff2 = (
-            [self.alloc_scratch(f"vdiff{i}_batch{b}", VLEN) for b in range(N_BATCH)]
-            for i in range(2)
-        )
-        vddiff = [self.alloc_scratch(f"vddiff_batch{b}", VLEN) for b in range(N_BATCH)]
-
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
+        # required to match with reference
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
+        # ignored by simulator
         self.add("debug", ("comment", "Starting loop"))
 
         # ---- Main program ----
-
-        # TODO: now, let's try two batches at once!
-
-        # Load initial values for first batch.
-        # tmp_addr1 contains current address; used for storing
-        # tmp_addr2 contains next address; used for loading
-        self.add_bundle(
-            alu=[
-                (
-                    "+",
-                    tmp_addr1[0],
-                    consts["inp_values_p"],
-                    consts["0"],
+        bundles = []
+        # Load initial value for first batch; load inp_values_p.
+        # Also need curr_addr and next_addr for each batch
+        curr_addr = batch_localize("curr_addr", 0)
+        next_addr = batch_localize("next_addr", 0)
+        val_name = vector(batch_localize("val", 0))
+        bundles.append(
+            multi_bundle(
+                single_bundle(
+                    op="vload",
+                    arg_names=[const("inp_values_p")],
+                    dest=val_name,
                 ),
-                (
-                    "+",
-                    tmp_addr2[0],
-                    consts["inp_values_p"],
-                    consts["vlen2"],
+                single_bundle(
+                    op="+",
+                    arg_names=[const("inp_values_p"), const("0")],
+                    dest=curr_addr,
                 ),
-                ("+", tmp_addr1[1], consts["inp_values_p"], consts["vlen1"]),
-                ("+", tmp_addr2[1], consts["inp_values_p"], consts["vlen3"]),
-            ],
-            load=[
-                ("vload", vval[0], consts["inp_values_p"]),
-            ],
+                single_bundle(
+                    op="+",
+                    arg_names=[const("inp_values_p"), const("s_vlen1")],
+                    dest=next_addr,
+                ),
+            )
         )
-        self.add_bundle(load=[("vload", vval[1], tmp_addr1[1])])
 
-        block = KernelBlock()  # block of instructions
+        for batch in range(0, batch_size, VLEN):
+            curr_addr = batch_localize("curr_addr", batch)
+            next_addr = batch_localize("next_addr", batch)
 
-        def batch_instrs(i_base, i_sub):
-            block = KernelBlock()
+            val_name = vector(batch_localize("val", batch))
+            idx_name = vector(batch_localize("idx", batch))
+            treeval_name = vector(batch_localize("treeval", batch))
+            next_val_name = vector(batch_localize("val", batch + VLEN))
             for round in range(rounds):
-                # Round 0 is special case
+                # round 0
                 if round % (forest_height + 1) == 0:
-                    # At the top, we use tree0 for vtreeval
-                    block.add_bundle(
-                        valu=[("^", vval[i_sub], vval[i_sub], consts["vtreeval0"])]
+                    bundles.extend(
+                        make_round0(val_name, idx_name, treeval_name, batch, round)
                     )
-                    block.append_block(
-                        self.vbuild_hash(vval[i_sub], vtmp1[i_sub], consts)
+                # round 1
+                elif round % (forest_height + 1) == 1:
+                    bundles.extend(
+                        make_round1(val_name, idx_name, treeval_name, batch, round)
                     )
-                    block.add_bundle(
-                        valu=[("%", vparity[i_sub], vval[i_sub], consts["v2"])]
-                    )
-                    block.add_bundle(
-                        valu=[
-                            ("+", vidx[i_sub], consts["v1"], vparity[i_sub]),
-                            (
-                                "multiply_add",
-                                vtreeval[i_sub],
-                                vparity[i_sub],
-                                consts["vdiff21"],
-                                consts["vtreeval1"],
-                            ),
-                        ]
-                    )
-                    continue
-                # Round 1: most complicated
-                if round % (forest_height + 1) == 1:
-                    block.add_bundle(
-                        valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
-                    )
-                    hash_block = self.vbuild_hash(vval[i_sub], vtmp1[i_sub], consts)
-                    hash_block.hijack_first(
-                        valu=[
-                            (
-                                "multiply_add",
-                                vidx[i_sub],
-                                consts["v2"],
-                                vidx[i_sub],
-                                consts["v1"],
-                            )
-                        ]
-                    )
-                    block.append_block(hash_block)
-                    # update parity and tmpidx
-                    block.add_bundle(
-                        valu=[
-                            ("%", vparity[i_sub], vval[i_sub], consts["v2"]),
-                            ("-", vtmpidx[i_sub], vidx[i_sub], consts["v3"]),
-                        ]
-                    )
-                    # compute diffs
-                    block.add_bundle(
-                        valu=[
-                            (
-                                "multiply_add",
-                                vdiff1[i_sub],
-                                vparity[i_sub],
-                                consts["vdiff43"],
-                                consts["vtreeval3"],
-                            ),
-                            (
-                                "multiply_add",
-                                vdiff2[i_sub],
-                                vparity[i_sub],
-                                consts["vdiff65"],
-                                consts["vtreeval5"],
-                            ),
-                            ("+", vidx[i_sub], vidx[i_sub], vparity[i_sub]),
-                        ]
-                    )
-                    # compute diff of diffs and get higher bit of tmpidx
-                    block.add_bundle(
-                        valu=[
-                            ("-", vddiff[i_sub], vdiff2[i_sub], vdiff1[i_sub]),
-                            (">>", vtmpidx[i_sub], vtmpidx[i_sub], consts["v1"]),
-                        ]
-                    )
-                    block.add_bundle(
-                        valu=[
-                            (
-                                "multiply_add",
-                                vtreeval[i_sub],
-                                vtmpidx[i_sub],
-                                vddiff[i_sub],
-                                vdiff1[i_sub],
-                            )
-                        ]
-                    )
-                    continue
-                # Wraparound round
-                if (round + 1) % (forest_height + 1) == 0:
-                    block.add_bundle(
-                        valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
-                    )
-                    block.append_block(
-                        self.vbuild_hash(vval[i_sub], vtmp1[i_sub], consts)
-                    )
-                    continue
-                # Last round
-                if round == rounds - 1:
-                    # First do the hashing. But then we don't need to load treeval or change idx or anything.
-                    block.add_bundle(
-                        valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
-                    )
-                    block.append_block(
-                        self.vbuild_hash(vval[i_sub], vtmp1[i_sub], consts)
-                    )
-                    # tmp_addr1 has current address, used for storing; tmp_addr2 has next address, used for loading; update tmp_addr1 and tmp_addr2
-                    # only issue load if there is more in batch
-                    load_insts = (
-                        [("vload", vval[i_sub], tmp_addr2[i_sub])]
-                        if i_base + 2 * VLEN < batch_size
-                        else []
-                    )
-                    block.add_bundle(
-                        store=[("vstore", tmp_addr1[i_sub], vval[i_sub])],
-                        alu=[
-                            ("+", tmp_addr1[i_sub], tmp_addr1[i_sub], consts["vlen2"]),
-                            ("+", tmp_addr2[i_sub], tmp_addr2[i_sub], consts["vlen2"]),
-                        ],
-                        load=load_insts,
-                    )
-                    continue
-
-                # Round 2+: steady-state
-                block.add_bundle(
-                    valu=[("^", vval[i_sub], vval[i_sub], vtreeval[i_sub])]
-                )
-                hash_block = self.vbuild_hash(vval[i_sub], vtmp1[i_sub], consts)
-                hash_block.hijack_first(
-                    valu=[
-                        (
-                            "multiply_add",
-                            vidx[i_sub],
-                            consts["v2"],
-                            vidx[i_sub],
-                            consts["v1"],
+                # wraparound round
+                elif (round + 1) % (forest_height + 1) == 0:
+                    bundles.extend(
+                        make_wraparound_round(
+                            val_name, idx_name, treeval_name, batch, round
                         )
-                    ]
-                )
-                block.append_block(hash_block)
-                block.add_bundle(
-                    valu=[
-                        ("%", vparity[i_sub], vval[i_sub], consts["v2"]),
-                    ]
-                )
-                block.add_bundle(valu=[("+", vidx[i_sub], vidx[i_sub], vparity[i_sub])])
-                # Gather using this index; first we need to calculate address
-                block.add_bundle(
-                    alu=[
-                        (
-                            "+",
-                            tmp_addr3[i_sub],
-                            consts["forest_values_p"],
-                            vidx[i_sub],
-                        )
-                    ]
-                )
-                # Then overlap loads with address calc
-                for i_off in range(1, VLEN):
-                    block.add_bundle(
-                        load=[("load", vtreeval[i_sub] + i_off - 1, tmp_addr3[i_sub])],
-                        alu=[
-                            (
-                                "+",
-                                tmp_addr3[i_sub],
-                                consts["forest_values_p"],
-                                vidx[i_sub] + i_off,  # i_off'th element in vector
-                            )
-                        ],
                     )
-                block.add_bundle(
-                    load=[("load", vtreeval[i_sub] + VLEN - 1, tmp_addr3[i_sub])]
+                # last round
+                elif round == rounds - 1:
+                    bundles.extend(
+                        make_last_round(
+                            val_name,
+                            next_val_name,
+                            treeval_name,
+                            batch,
+                            round,
+                        )
+                    )
+                else:
+                    bundles.extend(
+                        make_mid_round(val_name, idx_name, treeval_name, batch, round)
+                    )
+
+            # Add in the curr_addr and next_addr for each batch
+            bundles.append(
+                multi_bundle(
+                    single_bundle(
+                        batch=batch,
+                        op="+",
+                        arg_names=[curr_addr, const("s_vlen1")],
+                        dest=batch_localize("curr_addr", batch + VLEN),
+                        frees={curr_addr},
+                        comment="i am here",
+                    ),
+                    single_bundle(
+                        batch=batch,
+                        op="+",
+                        arg_names=[next_addr, const("s_vlen1")],
+                        dest=batch_localize("next_addr", batch + VLEN),
+                        frees={next_addr},
+                    ),
                 )
-            return block
-
-        for i_base in range(0, batch_size, 2 * VLEN):
-            blocks = [batch_instrs(i_base, i_sub) for i_sub in range(2)]
-            block.append_block(blocks[0].interleave(blocks[1]))
-
-        self.instrs.extend(block.instrs)
+            )
+        prog = SymbolicProgram(bundles)
+        self.instrs.extend(
+            prog.to_concrete({}, scalar_freelist, vector_freelist, consts)
+        )
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
-
-    # For the two-stage hashing operation, put one intermediate in vval and one in vtmp.
-    # if vout is specified, then the final result is stored in vout.
-    def vbuild_hash(self, vval, vtmp, consts, vout=None) -> KernelBlock:
-        block = KernelBlock()
-        if vout is None:
-            vout = vval
-        # (vval op1 val1) op2 (vval op3 val3)
-        # val1 and val3 are precomputed/prebroadcasted
-        for i, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
-            if i in (0, 2, 4):
-                block.add_bundle(
-                    valu=[
-                        (
-                            "multiply_add",
-                            vout,
-                            vval,
-                            consts[f"vhash_mult{i}"],
-                            consts[f"vhash_add{i}"],
-                        )
-                    ]
-                )
-                continue
-            # Otherwise, do two ops in parallel, then combine
-            block.add_bundle(
-                valu=[
-                    (op1, vval, vval, consts[f"vhash_add{i}"]),
-                    (op3, vtmp, vval, consts[f"vhash_mult{i}"]),
-                ]
-            )
-            dst = vout if i == 5 else vval
-            block.add_bundle(valu=[(op2, dst, vval, vtmp)])
-        return block
 
 
 BASELINE = 147734

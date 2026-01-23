@@ -1034,8 +1034,9 @@ class KernelBuilder:
     # Make scratch registers. Modifies scratch allocator but does not issue instructions.
     def make_freelists(self):
         # Right now, starts at 250. We can go up to 1535.
-        N_SCALAR_REG = 32 * 3  # 3 addr registers for each batch
-        # This means we have 1190 / 8 = 148 vector registers to work with.
+        # 3 addr registers for each batch: curr_addr, next_addr, tmp_addr
+        N_SCALAR_REG = 32 * 3
+        # This means we have 1190 // 8 = 148 vector registers to work with.
         N_VECTOR_REG = 148
 
         # Make the freelist. Vector and scalar are separated; we must reconcile this difference.

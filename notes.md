@@ -145,6 +145,7 @@
   - N = 3 means 1312 is possible if we have perfect packing
   - N = 4 means we can get to 1056, and this is only two vloads
   - N = 5 means 800, but seems a lot hairier? 4 vloads
+  - after this, N = 6 means the 6th one doesn't actually get used because rounds = 16; rounds % (forest_neight + 1) = 5
 - how are we going to make use of cache?
   - round 0: one possibility
   - round 1: two possibilities, 1 vselect

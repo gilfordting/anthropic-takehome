@@ -953,6 +953,45 @@ def make_mid_round(
     )
     return bundles
 
+def make_batch_insts(
+    batch: int, rounds: int, forest_height: int
+) -> list[SymbolicBundle]:
+    bundles = []
+    curr_addr_name = batch_localize("curr_addr", batch)
+    val_name = vector(batch_localize("val", batch))
+    idx_name = vector(batch_localize("idx", batch))
+    treeval_name = vector(batch_localize("treeval", batch))
+
+    # Load initial value for first batch; load inp_values_p.
+    bundles.extend(make_initial_load(curr_addr_name, val_name, batch, 0))
+    for round in range(rounds):
+        # round 0
+        if round % (forest_height + 1) == 0:
+            bundles.extend(make_round0(val_name, idx_name, treeval_name, batch, round))
+        # round 1
+        elif round % (forest_height + 1) == 1:
+            bundles.extend(make_round1(val_name, idx_name, treeval_name, batch, round))
+        # wraparound round
+        elif (round + 1) % (forest_height + 1) == 0:
+            bundles.extend(
+                make_wraparound_round(val_name, idx_name, treeval_name, batch, round)
+            )
+        # last round
+        elif round == rounds - 1:
+            bundles.extend(
+                make_last_round(
+                    val_name,
+                    curr_addr_name,
+                    treeval_name,
+                    batch,
+                    round,
+                )
+            )
+        else:
+            bundles.extend(
+                make_mid_round(val_name, idx_name, treeval_name, batch, round, rounds)
+            )
+    return bundles
 
 class KernelBuilder:
     def __init__(self):
@@ -1164,11 +1203,16 @@ class KernelBuilder:
 
     # Make scratch registers. Modifies scratch allocator but does not issue instructions.
     def make_freelists(self):
-        # Right now, starts at 250. We can go up to 1535.
-        # 3 addr registers for each batch: curr_addr, next_addr, tmp_addr
-        N_SCALAR_REG = 32 * 3
-        # This means we have 1190 // 8 = 148 vector registers to work with.
-        N_VECTOR_REG = 148
+        # Scalar: 8 numerical constants, 1 vlen, 12 hash constants
+        # Vector regs: 1 init vars, 1 tree vals
+        # Broadcast: 8 numerical, 8 treevals, 12 hash constants
+        # vDiffs: 3
+        # 285 constant registers.
+        N_CONST_REG = (8 + 1 + 12) + 8 * (1 + 1) + 8 * (8 + 8 + 12) + 8 * 3
+        # 2 scalar registers per batch: curr_addr, and one scratch
+        N_SCALAR_REG = 32 * 2
+        # currently 148; 4.625 vec registers per batch. probably ok
+        N_VECTOR_REG = (SCRATCH_SIZE - N_CONST_REG - N_SCALAR_REG) // VLEN
 
         # Make the freelist. Vector and scalar are separated; we must reconcile this difference.
         scalar_freelist = set(self.alloc_scratch() for _ in range(N_SCALAR_REG))
@@ -1182,10 +1226,10 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         # makes constant mappings, as well as instructions for setup phase
-        # this is only 11 cycles; simpler to just have it fully separate. not much overhead
+        # this is only 12 cycles; simpler to just have it fully separate. not much overhead
         consts = self.build_const_mapping()
 
-        # make register freelists. this is free
+        # make register freelists. this is free (no cycles)
         scalar_freelist, vector_freelist = self.make_freelists()
         assert all(reg < 1536 for reg in scalar_freelist), (
             "scalar register is out of bounds"
@@ -1203,48 +1247,7 @@ class KernelBuilder:
         bundles = []
 
         for batch in range(0, batch_size, VLEN):
-            curr_addr_name = batch_localize("curr_addr", batch)
-            val_name = vector(batch_localize("val", batch))
-            idx_name = vector(batch_localize("idx", batch))
-            treeval_name = vector(batch_localize("treeval", batch))
-
-            # Load initial value for first batch; load inp_values_p.
-            bundles.extend(make_initial_load(curr_addr_name, val_name, batch, 0))
-            for round in range(rounds):
-                # round 0
-                if round % (forest_height + 1) == 0:
-                    bundles.extend(
-                        make_round0(val_name, idx_name, treeval_name, batch, round)
-                    )
-                # round 1
-                elif round % (forest_height + 1) == 1:
-                    bundles.extend(
-                        make_round1(val_name, idx_name, treeval_name, batch, round)
-                    )
-                # wraparound round
-                elif (round + 1) % (forest_height + 1) == 0:
-                    bundles.extend(
-                        make_wraparound_round(
-                            val_name, idx_name, treeval_name, batch, round
-                        )
-                    )
-                # last round
-                elif round == rounds - 1:
-                    bundles.extend(
-                        make_last_round(
-                            val_name,
-                            curr_addr_name,
-                            treeval_name,
-                            batch,
-                            round,
-                        )
-                    )
-                else:
-                    bundles.extend(
-                        make_mid_round(
-                            val_name, idx_name, treeval_name, batch, round, rounds
-                        )
-                    )
+            bundles.extend(make_batch_insts(batch, rounds, forest_height))
         prog = SymbolicProgram(bundles)
         self.instrs.extend(
             prog.to_concrete({}, scalar_freelist, vector_freelist, consts)

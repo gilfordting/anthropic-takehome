@@ -328,10 +328,20 @@ class SymbolicProgram:
         vector_freelist: set[int],
         consts: dict[str, int],
     ) -> list[Instruction]:
-        return [
+        old_scalar_freelist = {i for i in scalar_freelist}
+        old_vector_freelist = {i for i in vector_freelist}
+        insts = [
             bundle.to_concrete(using, scalar_freelist, vector_freelist, consts)
             for bundle in self.bundles
         ]
+        # we should be back to the same
+        assert len(vector_freelist) == len(old_vector_freelist)
+        assert all(i in old_vector_freelist for i in vector_freelist)
+        # some error margin allowed for scalar freelist (addresses)
+        assert abs(len(scalar_freelist) - len(old_scalar_freelist)) < 4
+        assert all(i in old_scalar_freelist for i in scalar_freelist)
+
+        return insts
 
 
 def infer_engine(op: str) -> Engine:
@@ -725,6 +735,7 @@ def make_mid_round(
     treeval_name: str,
     batch: int,
     round: int,
+    rounds: int,
 ) -> list[SymbolicBundle]:
     bundles = []
     inX = vector(localize("inX", batch, round))
@@ -784,11 +795,13 @@ def make_mid_round(
             vector_offsets={idx_name: 0},
         )
     )
-    # if next round is wraparound, free idx
+    # if next round is wraparound or last round, free idx
     forest_height = 10
     for i in range(1, VLEN):
         frees = set()
-        if (round + 2) % (forest_height + 1) == 0 and i == VLEN - 1:
+        next_round_is_wraparound = (round + 2) % (forest_height + 1) == 0
+        next_round_is_last = round + 1 == rounds - 1
+        if (next_round_is_wraparound or next_round_is_last) and i == VLEN - 1:
             frees = {idx_name}
         bundles.append(
             multi_bundle(
@@ -1134,7 +1147,9 @@ class KernelBuilder:
                     )
                 else:
                     bundles.extend(
-                        make_mid_round(val_name, idx_name, treeval_name, batch, round)
+                        make_mid_round(
+                            val_name, idx_name, treeval_name, batch, round, rounds
+                        )
                     )
 
             # Add in the curr_addr and next_addr for each batch

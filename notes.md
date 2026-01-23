@@ -309,35 +309,48 @@ x <- fma x, constmult, constadd
 - "long-term" must be kept track of
   - this is not a general solution?
 
-## Constant mapping
+## Constants setup
 
-Scalar constants that we then vectorize.
+Need to:
+
+- allocate scratch space
+- broadcast, if vector
+- register in const_mapping
 
 ### Scalar
 
-- provided variables
-  - load with `vload`
 - numerical: 0, 1, 2, 3
-  - load with `const`
-- hash constants: 2 for each of the 6 hash stages
   - load with `const`
 - vlens: factors 1, 2, 3
   - load with `const`
+- hash: add factor, shift/mul factor, across 6 stages
+  - load with `const`
+
+- provided variables
+  - load with `vload`
+- tree values: first 8
+  - load with `vload`
 
 ### Vector
 
+these we need to
+
 - numerical: v0, v1, v2, v3
   - `vbroadcast` scalar after loaded
--
+- tree values: 8
+  - `vbroadcast` scalars after loaded
+- hash factors
+  - `vbroadcast` scalar after loaded
+- diffs: 2-1, 4-3, 6-5
+  - `valu -` after broadcasting tree vals
 
-# We have scalar constants, and then we vectorize them
+scalars: "{i}", "vlen{i}", "hash_add{i}", "hash_mult{i}"
+scalars: same as init_vars, "treeval{i}"
+vectors: "v{i}", "vtreeval{i}", "vhash_add{i}", "vhash_mult{i}"
+also: "vdiff21", "vdiff43", "vdiff65"
 
-# Scalar constants
+Got it down to 11 cycles.
 
-# - all the provided variables. rounds, n_nodes, batch_size, forest_height, forest_values_p, inp_indices_p, inp_values_p
+### Register renaming
 
-# -
-
-# - numerical: 0, 1, 2, 3
-
-# -
+goal: simply allocate a pool of vector registers, and a pool of scalar registers. then all we have to is define a symbolic program with infinite registers, and the system handles regalloc to physical registers.

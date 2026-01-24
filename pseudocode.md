@@ -61,6 +61,50 @@ valu multiply_add idx_name <- const v2, idx_name, const v1
 valu multiply_add treeval <- upperbit1, ddiff, diff1
 ```
 
+### round 2
+
+[scratch](https://docs.google.com/spreadsheets/d/1PiXPo-L16TS667PRALQBl8A0-6l5BOEvm7pL1Kl1PI4/edit?gid=0#gid=0)
+
+```asm
+hash_in = val ^ treeval; frees val, treeval
+...val = hash(hash_in); frees in1
+@parallel
+    idx = 2*idx + 1
+    parity = val % 2
+
+idx += parity; frees parity
+
+@parallel
+    norm_idx = idx - 7
+
+@parallel
+    bit0 = norm_idx & 1
+    norm_idx >>= 1
+
+@parallel
+    lerp87 = bit0 \* diff87 + vtree7; frees bit0
+    lerp109 = bit0 \* diff109 + vtree9; frees bit0
+    lerp1211 = bit0 \* diff1211 + vtree11; frees bit0
+    lerp1413 = bit0 \* diff1413 + vtree13; frees bit0
+
+@parallel
+    bit1 = norm_idx & 1
+    norm_idx >>= 1
+    ddiff10987 = lerp109 - lerp87; frees lerp109
+    ddiff14131211 = lerp1413 - lerp1211; frees lerp1413
+
+@parallel
+    lerp10987 = bit1 \* ddiff10987 + lerp87; frees bit1, lerp87, ddiff10987
+    lerp14131211 = bit1 \* ddiff14131211 + lerp1211; frees bit1, lerp1211, ddiff14131211
+
+@parallel
+    bit2 = norm_idx & 1; frees: norm_idx
+    dddiff147 = lerp14131211 - lerp10987; frees lerp14131211
+
+@parallel
+    treeval = bit2 \* dddiff147 + lerp10987; frees bit2, dddiff147, lerp10987
+```
+
 ### wraparound
 
 ```asm

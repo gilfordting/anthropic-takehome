@@ -15,6 +15,7 @@ We recommend you look through problem.py next.
 
 from collections import defaultdict
 from dataclasses import dataclass
+from itertools import pairwise
 import random
 from typing import Optional
 import unittest
@@ -247,7 +248,26 @@ class SymbolicBundle:
     def __post_init__(self):
         # destination names must be unique
         dests = [slot.dest for slot in self.slots if slot.dest is not None]
-        assert len(dests) == len(set(dests)), "destination names must be unique"
+        if len(dests) != len(set(dests)):
+            # if a thing is repeated, check that it's to a vector offset that's different
+            for dest in set(dests):
+                offsets = []
+                if dests.count(dest) <= 1:
+                    continue
+                # this one is repeated
+                for slot in self.slots:
+                    if slot.dest != dest:
+                        continue
+                    assert slot.vector_offsets is not None, (
+                        "vector offsets must be specified for repeated destinations"
+                    )
+                    assert dest in slot.vector_offsets, (
+                        "destination must be in vector offsets"
+                    )
+                    offsets.append(slot.vector_offsets[dest])
+                assert len(offsets) == len(set(offsets)), (
+                    "vector offsets must be different for repeated destinations"
+                )
 
     def check_slot_condition(self) -> bool:
         for engine, limit in SLOT_LIMITS.items():
@@ -494,6 +514,8 @@ class VLIWScheduler:
         vector_freelist: set[int],
         consts: dict[str, int],
     ) -> list[Instruction]:
+        old_scalar_freelist = {i for i in scalar_freelist}
+        old_vector_freelist = {i for i in vector_freelist}
         insts = []
         for prog in self.progs:
             prog.populate_heuristics()
@@ -528,6 +550,14 @@ class VLIWScheduler:
             insts.append(
                 bundle.to_concrete(using, scalar_freelist, vector_freelist, consts)
             )
+
+        # we should be back to the same
+        assert len(vector_freelist) == len(old_vector_freelist)
+        assert all(i in old_vector_freelist for i in vector_freelist)
+        assert len(scalar_freelist) == len(old_scalar_freelist)
+        # some error margin allowed for scalar freelist (addresses)?
+        # assert abs(len(scalar_freelist) - len(old_scalar_freelist)) < 4
+        assert all(i in old_scalar_freelist for i in scalar_freelist)
         return insts
 
         # which programs are the most promising?
@@ -602,16 +632,28 @@ def make_initial_load(
         return bundles
 
     first_shift, rest = shifts[0], shifts[1:]
-    single_bundles = [
-        single_bundle(
-            batch=batch,
-            round=round,
-            op="<<",
-            arg_names=[const("1"), const(str(first_shift))],
-            dest=curr_addr_name,
-            comment="first shift",
+    single_bundles = []
+    if first_shift == 0:
+        # don't have 0; 1 << i = 1 << 0 = 1
+        single_bundles.append(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="-",
+                arg_names=[const("2"), const("1")],
+                dest=curr_addr_name,
+            )
         )
-    ]
+    else:
+        single_bundles.append(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="<<",
+                arg_names=[const("1"), const(str(first_shift))],
+                dest=curr_addr_name,
+            )
+        )
     # can do two shifts in parallel on the first cycle
     if len(rest) > 0:
         single_bundles.append(
@@ -691,6 +733,7 @@ def make_initial_load(
     )
     return bundles
 
+
 # in_name is provided, and we reuse it for a lot of stuff
 def make_hash(
     in_name: str, out_name: str, batch: int, round: int
@@ -716,8 +759,8 @@ def make_hash(
                     op="multiply_add",
                     arg_names=[
                         curr,
-                        const(f"vhash_mult{i}"),
-                        const(f"vhash_add{i}"),
+                        vconst(f"hash_mult{i}"),
+                        vconst(f"hash_add{i}"),
                     ],
                     dest=curr,
                 )
@@ -731,7 +774,7 @@ def make_hash(
                     batch=batch,
                     round=round,
                     op=op1,
-                    arg_names=[curr, const(f"vhash_add{i}")],
+                    arg_names=[curr, vconst(f"hash_add{i}")],
                     dest=tmp1,
                     frees={curr},
                 ),
@@ -739,7 +782,7 @@ def make_hash(
                     batch=batch,
                     round=round,
                     op=op3,
-                    arg_names=[curr, const(f"vhash_mult{i}")],
+                    arg_names=[curr, vconst(f"hash_mult{i}")],
                     dest=tmp2,
                     frees={curr},
                 ),
@@ -917,6 +960,216 @@ def make_round1(
     return bundles
 
 
+def make_round2(
+    val_name: str, idx_name: str, treeval_name: str, batch: int, round: int
+) -> list[SymbolicBundle]:
+    bundles = []
+    # make variables
+    hash_in = vector(localize("hash_in", batch, round))
+    parity = vector(localize("parity", batch, round))
+    norm_idx = vector(localize("norm_idx", batch, round))
+    bit0, bit1, bit2 = [vector(localize(f"bit{i}", batch, round)) for i in range(3)]
+    lerp87, lerp109, lerp1211, lerp1413 = [
+        vector(localize(f"lerp{i}{i - 1}", batch, round)) for i in range(8, 16, 2)
+    ]
+    ddiff10987, ddiff14131211 = [
+        vector(localize(f"ddiff{s}", batch, round)) for s in ("10987", "14131211")
+    ]
+    lerp10987, lerp14131211 = [
+        vector(localize(f"lerp{s}", batch, round)) for s in ("10987", "14131211")
+    ]
+    ddiff147 = vector(localize("ddiff147", batch, round))
+
+    # algorithm
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="valu^",
+            arg_names=[val_name, treeval_name],
+            dest=hash_in,
+            frees={val_name, treeval_name},
+        )
+    )
+    bundles.extend(make_hash(hash_in, val_name, batch, round))
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[vconst("2"), idx_name, vconst("1")],
+                dest=idx_name,
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu%",
+                arg_names=[val_name, vconst("2")],
+                dest=parity,
+            ),
+        )
+    )
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="valu+",
+            arg_names=[idx_name, parity],
+            dest=idx_name,
+            frees={parity},
+        )
+    )
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="valu-",
+            arg_names=[idx_name, vconst("7")],
+            dest=norm_idx,
+        ),
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu&",
+                arg_names=[norm_idx, vconst("1")],
+                dest=bit0,
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu>>",
+                arg_names=[norm_idx, vconst("1")],
+                dest=norm_idx,
+            ),
+        )
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[bit0, vconst("diff87"), vconst("treeval7")],
+                dest=lerp87,
+                frees={bit0},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[bit0, vconst("diff109"), vconst("treeval9")],
+                dest=lerp109,
+                frees={bit0},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[bit0, vconst("diff1211"), vconst("treeval11")],
+                dest=lerp1211,
+                frees={bit0},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[bit0, vconst("diff1413"), vconst("treeval13")],
+                dest=lerp1413,
+                frees={bit0},
+            ),
+        )
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu&",
+                arg_names=[norm_idx, vconst("1")],
+                dest=bit1,
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu>>",
+                arg_names=[norm_idx, vconst("1")],
+                dest=norm_idx,
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu-",
+                arg_names=[lerp109, lerp87],
+                dest=ddiff10987,
+                frees={lerp109},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu-",
+                arg_names=[lerp1413, lerp1211],
+                dest=ddiff14131211,
+                frees={lerp1413},
+            ),
+        )
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[bit1, ddiff10987, lerp87],
+                dest=lerp10987,
+                frees={bit1, lerp87, ddiff10987},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[bit1, ddiff14131211, lerp1211],
+                dest=lerp14131211,
+                frees={bit1, lerp1211, ddiff14131211},
+            ),
+        )
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu&",
+                arg_names=[norm_idx, vconst("1")],
+                dest=bit2,
+                frees={norm_idx},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu-",
+                arg_names=[lerp14131211, lerp10987],
+                dest=ddiff147,
+                frees={lerp14131211},
+            ),
+        )
+    )
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="multiply_add",
+            arg_names=[bit2, ddiff147, lerp10987],
+            dest=treeval_name,
+            frees={bit2, ddiff147, lerp10987},
+        )
+    )
+    return bundles
+
+
 def make_wraparound_round(
     val_name: str, idx_name: str, treeval_name: str, batch: int, round: int
 ) -> list[SymbolicBundle]:
@@ -984,7 +1237,8 @@ def make_mid_round(
     inX = vector(localize("inX", batch, round))
     parityX = vector(localize("parityX", batch, round))
     # this is a scalar register!
-    tmp_addr = batch_localize("tmp_addr", batch)
+    tmp_addr1 = batch_localize("tmp_addr1", batch)
+    tmp_addr2 = batch_localize("tmp_addr2", batch)
     bundles.append(
         single_bundle(
             batch=batch,
@@ -1028,59 +1282,108 @@ def make_mid_round(
     )
     # gather
     # first, calc address: forest_values_p + idx[0]
-    bundles.append(
-        single_bundle(
-            batch=batch,
-            round=round,
-            op="+",
-            arg_names=[const("forest_values_p"), idx_name],
-            dest=tmp_addr,
-            vector_offsets={idx_name: 0},
-        )
+    bundles.extend(
+        [
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="+",
+                arg_names=[const("forest_values_p"), idx_name],
+                dest=tmp_addr1,
+                vector_offsets={idx_name: 0},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="+",
+                arg_names=[const("forest_values_p"), idx_name],
+                dest=tmp_addr2,
+                vector_offsets={idx_name: 1},
+            ),
+        ]
     )
     # if next round is wraparound or last round, free idx
     forest_height = 10
-    for i in range(1, VLEN):
+    next_round_is_wraparound = (round + 2) % (forest_height + 1) == 0
+    next_round_is_last = round + 1 == rounds - 1
+    should_free_idx = next_round_is_wraparound or next_round_is_last
+    for i in range(2, VLEN, 2):
         frees = set()
-        next_round_is_wraparound = (round + 2) % (forest_height + 1) == 0
-        next_round_is_last = round + 1 == rounds - 1
-        if (next_round_is_wraparound or next_round_is_last) and i == VLEN - 1:
+
+        if should_free_idx and i == VLEN - 2:
             frees = {idx_name}
-        bundles.append(
-            multi_bundle(
+        # always load, regardless
+        single_bundles = [
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="load",
+                arg_names=[tmp_addr1],
+                dest=treeval_name,
+                vector_offsets={treeval_name: i - 2},
+                frees={tmp_addr1},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="load",
+                arg_names=[tmp_addr2],
+                dest=treeval_name,
+                vector_offsets={treeval_name: i - 1},
+                frees={tmp_addr2},
+            ),
+        ]
+        # load tmp_addr for all but last iteration
+        # for the last time we load tmp_addr, we release idx
+        single_bundles.extend(
+            [
                 single_bundle(
                     batch=batch,
                     round=round,
                     op="+",
                     arg_names=[const("forest_values_p"), idx_name],
-                    dest=tmp_addr,
+                    dest=tmp_addr1,
                     vector_offsets={idx_name: i},
                     frees=frees,
                 ),
-                # Load from tmp_addr into offset vector reg
                 single_bundle(
                     batch=batch,
                     round=round,
-                    op="load",
-                    arg_names=[tmp_addr],
-                    dest=treeval_name,
-                    vector_offsets={treeval_name: i - 1},
-                    frees={tmp_addr},
+                    op="+",
+                    arg_names=[const("forest_values_p"), idx_name],
+                    dest=tmp_addr2,
+                    vector_offsets={idx_name: i + 1},
+                    frees=frees,
                 ),
-            )
+            ]
         )
+
+        bundles.append(multi_bundle(*single_bundles))
+    # residual load
     bundles.append(
-        single_bundle(
-            batch=batch,
-            round=round,
-            op="load",
-            arg_names=[tmp_addr],
-            dest=treeval_name,
-            vector_offsets={treeval_name: VLEN - 1},
-            frees={tmp_addr},
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="load",
+                arg_names=[tmp_addr1],
+                dest=treeval_name,
+                vector_offsets={treeval_name: VLEN - 2},
+                frees={tmp_addr1},
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="load",
+                arg_names=[tmp_addr2],
+                dest=treeval_name,
+                vector_offsets={treeval_name: VLEN - 1},
+                frees={tmp_addr2},
+            ),
         )
     )
     return bundles
+
 
 def make_batch_insts(
     batch: int, rounds: int, forest_height: int
@@ -1100,6 +1403,8 @@ def make_batch_insts(
         # round 1
         elif round % (forest_height + 1) == 1:
             bundles.extend(make_round1(val_name, idx_name, treeval_name, batch, round))
+        # elif round % (forest_height + 1) == 2:
+        #     bundles.extend(make_round2(val_name, idx_name, treeval_name, batch, round))
         # wraparound round
         elif (round + 1) % (forest_height + 1) == 0:
             bundles.extend(
@@ -1121,6 +1426,7 @@ def make_batch_insts(
                 make_mid_round(val_name, idx_name, treeval_name, batch, round, rounds)
             )
     return bundles
+
 
 class KernelBuilder:
     def __init__(self):
@@ -1167,19 +1473,41 @@ class KernelBuilder:
     def build_const_mapping(self):
         const_mapping = {}
 
+        # The only const registers we need to retain are:
+        # scalar: forest_values_p, inp_values_p, 01234, s_vlen
+        # vector: 1237, treeval0135791113, diff21, 43, 65, 87, 109, 1211, 1413, hash_mults and hash_adds
+
+        # Notably:
+        # - forest_values_p and inp_values_p are part of init_vars, can return the other 6 scalar regs
+        # - 7 is loaded in a scalar, we broadcast it, and then can return the scalar reg.
+        # - We load treevals 0-15, compute 7 diffs, and then throw away 2, 4, 6, 8, 10, 12, 14.
+        # hash_adds and hash_mults are loaded in scalars and broadcasted; we can return the scalar regs.
+
+        # Game plan:
+        # Scalar loads: 012347, s_vlen, hash vals
+        # Vector loads: init vars, treevals starting 0 and 8
+        # Vector broadcasts: 1237, treevals 0 to 14, hash vals
+        # vdiffs: diff21, 43, 65, 87, 109, 1211, 1413
+
+        # Can throw away:
+        # scalar: 7, init vars except for forest/inp_p, hash vals (?) we might have to come back to this if we want to be able to offload to regular ALU. TODO fix
+        # vector: treeval vectors at 0 and 8 (staging area), vtreeval 2, 4, 8, 12, 14
+
         # Input is list of (name, concrete value).
         # We allocate scratch space, load with const, and register in const_mapping.
-        # Returns the loads we need to perform.
+        # Returns the loads we need to perform, as a map from name to load instruction.
         def build_scalar_constants(scalars: list[tuple[str, int]]):
-            loads = []
+            loads = {}
             for name, val in scalars:
                 reg = self.alloc_scratch()
-                loads.append(("const", reg, val))
+                loads[name] = ("const", reg, val)
                 assert name not in const_mapping, f"Constant {name} already registered"
                 const_mapping[name] = reg
             return loads
 
-        num_loads = build_scalar_constants([(str(i), i) for i in range(8)])
+        SCALARS = list(range(5)) + [7]
+
+        num_loads = build_scalar_constants([(str(i), i) for i in SCALARS])
         vlen_loads = build_scalar_constants([("s_vlen", VLEN)])
         hash_add_loads = build_scalar_constants(
             [(f"hash_add{i}", imm) for i, (_, imm, _, _, _) in enumerate(HASH_STAGES)]
@@ -1211,26 +1539,40 @@ class KernelBuilder:
             "inp_values_p",
         ]
         init_vars_vload = vload_const_batch(init_vars, const_mapping["0"])
-        treevals_vload = vload_const_batch(
+        treevals0_vload = vload_const_batch(
             [f"treeval{i}" for i in range(VLEN)], const_mapping["forest_values_p"]
+        )
+
+        # use 7's reg as scratch after broadcasting and before returning
+        treeval8_addr_calc = (
+            "+",
+            const_mapping["7"],
+            const_mapping["forest_values_p"],
+            const_mapping["s_vlen"],
+        )
+        treevals8_vload = vload_const_batch(
+            [f"treeval{i}" for i in range(VLEN, 2 * VLEN)], const_mapping["7"]
         )
 
         # Input is list of (name, reg holding scalar val).
         # We allocate scratch space, broadcast the scalar, and register in const_mapping.
-        # Returns the broadcasts we need to perform.
+        # Returns the broadcasts we need to perform, as a map from name to broadcast instruction.
         def build_vector_constants(vectors: list[tuple[str, int]]):
-            broadcasts = []
+            broadcasts = {}
             for name, reg in vectors:
                 vbase_reg = self.alloc_scratch(length=VLEN)
                 const_mapping[name] = vbase_reg
-                broadcasts.append(("vbroadcast", vbase_reg, reg))
+                broadcasts[name] = ("vbroadcast", vbase_reg, reg)
             return broadcasts
 
         num_vbroadcasts = build_vector_constants(
-            [(f"v{i}", const_mapping[str(i)]) for i in range(4)]
+            [(f"v{i}", const_mapping[str(i)]) for i in (1, 2, 3, 7)]
         )
         treeval_vbroadcasts = build_vector_constants(
-            [(f"vtreeval{i}", const_mapping[f"treeval{i}"]) for i in range(VLEN)]
+            [
+                (f"vtreeval{i}", const_mapping[f"treeval{i}"])
+                for i in range(0, VLEN * 2 - 1)
+            ]
         )
         hash_add_vbroadcasts = build_vector_constants(
             [
@@ -1246,109 +1588,119 @@ class KernelBuilder:
         )
 
         # valu's for diffs
-        vdiff21, vdiff43, vdiff65 = [self.alloc_scratch(length=VLEN) for i in range(3)]
-        vdiff_info = list(zip([vdiff21, vdiff43, vdiff65], [2, 4, 6], [1, 3, 5]))
-        vdiff_valus = [
-            ("-", vreg, const_mapping[f"vtreeval{i1}"], const_mapping[f"vtreeval{i2}"])
-            for vreg, i1, i2 in vdiff_info
+        vdiff21, vdiff43, vdiff65, vdiff87, vdiff109, vdiff1211, vdiff1413 = [
+            self.alloc_scratch(length=VLEN) for i in range(7)
         ]
-        for vreg, i1, i2 in vdiff_info:
-            const_mapping[f"vdiff{i1}{i2}"] = vreg
+        vdiff_info = list(
+            zip(
+                [vdiff21, vdiff43, vdiff65, vdiff87, vdiff109, vdiff1211, vdiff1413],
+                [2, 4, 6, 8, 10, 12, 14],
+                [1, 3, 5, 7, 9, 11, 13],
+            )
+        )
+        vdiff_valus = {
+            f"vdiff{i1}{i2}": (
+                "-",
+                vreg,
+                const_mapping[f"vtreeval{i1}"],
+                const_mapping[f"vtreeval{i2}"],
+            )
+            for vreg, i1, i2 in vdiff_info
+        }
+        for s, (_, vreg, i1, i2) in vdiff_valus.items():
+            const_mapping[s] = vreg
 
-        # --- Now how to pack these? ---
-        # Longest dependency chain:
-        # load 0 --> load init vars --> vload treevals --> vbroadcast treevals --> valu diffs
+        scalars_to_return = (
+            ["0", "7"]
+            + [s for s in init_vars if s not in ("forest_values_p", "inp_values_p")]
+            + [f"hash_add{i}" for i in range(len(HASH_STAGES))]
+            + [f"hash_mult{i}" for i in range(len(HASH_STAGES))]
+        )
+        scalar_return = {const_mapping.pop(s) for s in scalars_to_return}
 
-        # Taking a step back:
-        # Scalar const loads: num_loads (4), vlen_loads (3), hash_add_loads (6), hash_mult_loads (6); there are 19 of these, and they don't have dependencies.
-        # Scalar vloads:
-        # - init_vars_vload: dependency on loading 0 const.
-        # - treevals_vload: dependency on loading forest_values_p (init_vars_vload).
-        # vbroadcasts:
-        # - num_vbroadcasts: 4, dependency on loading num_loads.
-        # - treeval_vbroadcasts: 8, dependency on scalar treevals (treevals_vload).
-        # - hash_add_vbroadcasts: 6, dependecy on scalars (hash_add_loads).
-        # - hash_mult_vbroadcasts: 6, dependency on scalars (hash_mult_loads).
-        # valus:
-        # - vdiff_valus: 3, dependency on vector treevals (treeval_vbroadcasts).
+        vectors_to_return = ["treeval0", "treeval8"] + [
+            f"vtreeval{i}" for i in (2, 4, 8, 12, 14)
+        ]
+        vector_return = {const_mapping.pop(v) for v in vectors_to_return}
+        for i in range(1, VLEN):
+            del const_mapping[f"treeval{i}"]
+        for i in range(9, VLEN * 2):
+            del const_mapping[f"treeval{i}"]
 
-        # Cycle 0: load 0, 1 scalar constants.
-        # Cycle 1: vload init vars, 1 vlen load, vbroadcast 0 and 1.
-        # Cycle 2: vload treevals,
         MAX_CYCLES = 20
         load_bundles = [[] for _ in range(MAX_CYCLES)]
         valu_bundles = [[] for _ in range(MAX_CYCLES)]
-        load_bundles[0].extend(num_loads[:2])
-        load_bundles[1].extend([init_vars_vload, num_loads[2]])
-        load_bundles[2].extend([treevals_vload, num_loads[3]])
-        load_bundles[3].extend(num_loads[4:6])
-        load_bundles[4].extend(num_loads[6:8])
-        # cycles 3 and beyond: the 6 hash_add loads, then the 6 hash_mult loads, then valu
-        for i in range(3):
-            load_bundles[5 + i].extend(hash_add_loads[i * 2 : i * 2 + 2])
-        for i in range(3):
-            load_bundles[8 + i].extend(hash_mult_loads[i * 2 : i * 2 + 2])
-        load_bundles[11].extend(vlen_loads)
-
-        # load 0: 0 and 1
-        # load 1: vload init vars, 2
-        # load 2: vload treevals, 3
-        # load 3: 4 and 5
-        # load 4: 6 and 7
-        # load 5: hashadds 0 and 1
-        # load 6: hashadds 2 and 3
-        # load 7: hashadds 4 and 5
-        # load 8: hashmults 0 and 1
-        # load 9: hashmults 2 and 3
-        # load 10: hashmults 4 and 5
-        # load 11: vlen
-
-        valu_bundles[1].extend(num_vbroadcasts[0:2])
-        # outstanding: 2
-        valu_bundles[2].append(num_vbroadcasts[2])
-        # outstanding: 3, 8 treevals
-        valu_bundles[3].extend([treeval_vbroadcasts[i] for i in (1, 2, 3, 4, 5, 6)])
-        # outstanding: 345, treevals 0 and 7
+        alu_bundles = [[] for _ in range(MAX_CYCLES)]
+        # cycle 0: load 0, 7
+        load_bundles[0].extend([num_loads["0"], num_loads["7"]])
+        # cycle 1: vload init vars, s_vlen; vbroadcast 7
+        load_bundles[1].extend([init_vars_vload, vlen_loads["s_vlen"]])
+        valu_bundles[1].extend([num_vbroadcasts["v7"]])
+        # cycle 2: vload treevals 0-7, load 1 ; alu 7 = forest_values + s_vlen
+        load_bundles[2].extend([treevals0_vload, num_loads["1"]])
+        alu_bundles[2].extend([treeval8_addr_calc])
+        # cycle 3: vload treevals 8-15, load 2; vbroadcast treevals 0 to 5
+        load_bundles[3].extend([treevals8_vload, num_loads["2"]])
+        valu_bundles[3].extend([treeval_vbroadcasts[f"vtreeval{i}"] for i in range(6)])
+        # cycle 4: load hashval0, 1; vbroadcast treevals 6 to 11;
+        load_bundles[4].extend([hash_add_loads[f"hash_add{i}"] for i in range(2)])
         valu_bundles[4].extend(
-            vdiff_valus
-            + [treeval_vbroadcasts[i] for i in (0, 7)]
-            + [num_vbroadcasts[3]]
+            [treeval_vbroadcasts[f"vtreeval{i}"] for i in range(6, 12)]
         )
-        # outstanding: 4567
-        valu_bundles[5].extend(num_vbroadcasts[4:8])
-        for i in range(3):
-            valu_bundles[6 + i].extend(hash_add_vbroadcasts[i * 2 : i * 2 + 2])
-        # outstanding: hashmults 0-1
-        for i in range(3):
-            valu_bundles[9 + i].extend(hash_mult_vbroadcasts[i * 2 : i * 2 + 2])
+        # cycle 5: load hashval2, 3; vbroadcast treevals 12 to 14, valu diff21, 43, 65
+        load_bundles[5].extend([hash_add_loads[f"hash_add{i}"] for i in range(2, 4)])
+        valu_bundles[5].extend(
+            [treeval_vbroadcasts[f"vtreeval{i}"] for i in range(12, 15)]
+            + [vdiff_valus[f"vdiff{i + 1}{i}"] for i in range(1, 6, 2)]  # 1 3 5
+        )
+        # cycle 6: load hashval4, 5; valu diff87, 109, 1211, 1413, vbroadcast 1, 2
+        load_bundles[6].extend([hash_add_loads[f"hash_add{i}"] for i in range(4, 6)])
+        valu_bundles[6].extend(
+            [vdiff_valus[f"vdiff{i + 1}{i}"] for i in range(7, 14, 2)]  # 7 9 11 13
+            + [num_vbroadcasts[f"v{i}"] for i in range(1, 3)]
+        )
+        # cycle 7: load hash_mult 0, 1; vbroadcast hash_add 0-5
+        load_bundles[7].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2)])
+        valu_bundles[7].extend(
+            [hash_add_vbroadcasts[f"vhash_add{i}"] for i in range(6)]
+        )
+        # cycle 8: load hash_mult 2, 3
+        load_bundles[8].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2, 4)])
+        # cycle 9: load hash_mult 4, 5
+        load_bundles[9].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(4, 6)])
+        # cycle 10: load 3, 4; vbroadcast hash_mult 0-5
+        load_bundles[10].extend([num_loads["3"], num_loads["4"]])
+        valu_bundles[10].extend(
+            [hash_mult_vbroadcasts[f"vhash_mult{i}"] for i in range(6)]
+        )
+        # cycle 11: vbroadcast 3
+        valu_bundles[11].extend([num_vbroadcasts["v3"]])
 
         setup_cycle_count = 0
-        for load_bundle, valu_bundle in zip(load_bundles, valu_bundles):
+        for load_bundle, valu_bundle, alu_bundle in zip(
+            load_bundles, valu_bundles, alu_bundles
+        ):
             if load_bundle or valu_bundle:
-                self.add_bundle(load=load_bundle, valu=valu_bundle)
+                self.add_bundle(load=load_bundle, valu=valu_bundle, alu=alu_bundle)
                 setup_cycle_count += 1
-        # print(f"setup cycle count: {setup_cycle_count}")
-        return const_mapping
+        return const_mapping, scalar_return, vector_return
 
     # Make scratch registers. Modifies scratch allocator but does not issue instructions.
-    def make_freelists(self):
-        # Scalar: 8 numerical constants, 1 vlen, 12 hash constants
-        # Vector regs: 1 init vars, 1 tree vals
-        # Broadcast: 8 numerical, 8 treevals, 12 hash constants
-        # vDiffs: 3
-        # 285 constant registers.
-        N_CONST_REG = (8 + 1 + 12) + 8 * (1 + 1) + 8 * (8 + 8 + 12) + 8 * 3
+    def make_freelists(self, scalar_return, vector_return):
+        scratch_left = SCRATCH_SIZE - self.scratch_ptr
         # 2 scalar registers per batch: curr_addr, and one scratch
-        N_SCALAR_REG = 32 * 2
-        # currently 148; 4.625 vec registers per batch. probably ok
-        N_VECTOR_REG = (SCRATCH_SIZE - N_CONST_REG - N_SCALAR_REG) // VLEN
+        N_SCALAR_REG = 32 * 3
+        num_extra_scalar = N_SCALAR_REG - len(scalar_return)
+        # take the rest for vector regs
+        num_vector_alloc = (scratch_left - num_extra_scalar) // VLEN
 
         # Make the freelist. Vector and scalar are separated; we must reconcile this difference.
-        scalar_freelist = set(self.alloc_scratch() for _ in range(N_SCALAR_REG))
+        scalar_freelist = set(self.alloc_scratch() for _ in range(num_extra_scalar))
+        scalar_freelist |= scalar_return
         vector_freelist = set(
-            self.alloc_scratch(length=VLEN) for _ in range(N_VECTOR_REG)
+            self.alloc_scratch(length=VLEN) for _ in range(num_vector_alloc)
         )
-
+        vector_freelist |= vector_return
         return scalar_freelist, vector_freelist
 
     def build_kernel(
@@ -1356,10 +1708,12 @@ class KernelBuilder:
     ):
         # makes constant mappings, as well as instructions for setup phase
         # this is only 12 cycles; simpler to just have it fully separate. not much overhead
-        consts = self.build_const_mapping()
+        consts, scalar_return, vector_return = self.build_const_mapping()
 
         # make register freelists. this is free (no cycles)
-        scalar_freelist, vector_freelist = self.make_freelists()
+        scalar_freelist, vector_freelist = self.make_freelists(
+            scalar_return, vector_return
+        )
         assert all(reg < 1536 for reg in scalar_freelist), (
             "scalar register is out of bounds"
         )

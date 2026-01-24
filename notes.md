@@ -404,11 +404,6 @@ check the number of scalar registers
 - tmp_addr for gather
 make_last_round; function signature was changed so change invocation
 
-## more bottleneck analysis
-
-- bottleneck on scratch space; peak vreg usage is 5, for round 1 but is short-lived
-- if we load even more we might screw smth up
-
 ## VLIW scheduling
 
 32 instruction streams
@@ -420,3 +415,65 @@ further optimizations:
 
 - split gather into either 1 or 2 load streams? depending on what's available
 - offload valu to 8 alu when overloaded
+
+## more bottleneck analysis
+
+- bottleneck on scratch space; peak vreg usage is 5, for round 1 but is short-lived
+- if we load even more we might screw smth up?
+- how many more do we need?
+- next, we have 8 more (for 16)
+- 4 diffs
+
+optimizing vector register usage:
+
+- which treevals do we actually use?
+  - init_vars? yes
+  - treevals_vload? these are broadcast and we don't use them after
+  - vector constants? one for each individual one loaded
+    - we use 2, 1, 3
+  - vtreeval's?
+    - we only use 0, 1, 3, 5 so far
+  - hash constants: use all 12
+  - diffs,
+
+so rn, with N = 3:
+
+- we can release the staging area treevals_vload: 1 vector reg
+- we can release vtreevals: 2, 4, 6, 7
+- we can release const v0
+
+so we can actually do 6 better
+
+if we go N = 4:
+
+- we need const v7
+- 4 diffs: 8-7, 10-9, 12-11, 14-13
+- vtreeval7, 9, 11, 13
+
+9 more registers. diff of 3 -- not actually that bad!
+
+main thing to be concerned about is register pressure in those two stages -- might be a lot?
+but let's hope we don't run out of registers LOL
+might also have to spread out valu's more, using the scalar alu units -- we consistently have 9 alu's idle, which can just be one vector lane
+and also turn it into a proper dependency/computation graph
+we also get bad utilization of load near the end
+
+- this would require a change to the structure of each SymbolicProgram
+SoL for N = 4 is 1056
+SoL for N = 5 is 1312
+Overhead is 157 cycles rn; if we keep this the same, estimated 1213 for N = 4?
+it takes 50 cycles to get to the first load
+
+so let's first do the caching for N = 4, then look at bottlenecks and see if we can speed things up
+
+okay what vector registers do we actually need?
+
+- treeval0, treeval1, treeval3, treeval5, 7, 9, 11, 13
+- 2, 1, 3, 7
+- diff21, 43, 65, 87, 109, 1211, 1413
+- hash_mults and hash_adds
+what about scalar?
+- forest_values_p
+- inp_values_p
+- 1, 01234
+- s_vlen

@@ -324,9 +324,31 @@ build constants first
 becomes
 valu_scalar partial_dest_0 op a1, a2, 0
 valu_scalar partial_dest_1 op, a1, a2, 1
-...
+..
 valu_scalar op partial_dest_7 a1, a2, 7
-vmerge dest, op partial_dest_0, partial_dest_1, partial_dest_2, partial_dest_3, partial_dest_4, partial_dest_5, partial_dest_6, partial_dest_7
+vmerge dest, partial_dest_0, partial_dest_1, partial_dest_2, partial_dest_3, partial_dest_4, partial_dest_5, partial_dest_6, partial_dest_7
 ```
 
 check that vmerge works fine as well
+
+## beginning
+
+```asm
+const load: 0, 1, 2, 3, 4, 5, 7, 15
+const load s_vlen, 8
+vload "0"
+vsplit 
+
+# TODO: how to handle unallocated vars here?
+
+
+hash_add_012345
+hash_mult_012345
+vload 0
+vload treeval0 <- forest_values_p
+
++ "7" "forest_values_p" "s_vlen"
+vload 
+```
+
+AssertionError: ext deps defaultdict(<class 'list'>, {'const inp_values_p': [SymbolicInstructionSlot(batch=0, engine='alu', op='+', arg_names=('const inp_values_p', 'const 0'), dest='curr_addr_batch0'), SymbolicInstructionSlot(batch=0, engine='load', op='vload', arg_names=('const inp_values_p',), dest='v_val_init_batch0')], 'const 0': [SymbolicInstructionSlot(batch=0, engine='alu', op='+', arg_names=('const inp_values_p', 'const 0'), dest='curr_addr_batch0')]}) do not match

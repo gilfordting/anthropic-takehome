@@ -508,7 +508,11 @@ what about scalar?
 
 ### design
 
-- first, get rid of vmerge noops
-- look at all of the leaves
-  - greedily put them into available slots
-  -
+- on each round, we produce 1 instruction
+  - first, get rid of vmerge noops
+  - then look at all of the leaves
+    - one by one, greedily insert each slot
+      - here is where we hijack to do vload_scalars stuff
+        - hacking to only allocate for first load
+    - if we run out of valu slots, can offload one to alu
+    - prioritize load > valu > alu?

@@ -258,6 +258,10 @@ class SymbolicInstructionSlot:
     def has_def(self) -> bool:
         return self.dest is not None
 
+    @property
+    def is_notable(self) -> bool:
+        return self.engine == "load" or self.engine == "store"
+
     def to_concrete(
         self,
         using: dict[str, int],
@@ -283,11 +287,7 @@ class SymbolicInstructionSlot:
             arg_names = (addr,)
 
         def to_reg(name: str) -> int:
-            yes = is_const(name)
-            if yes is None:
-                assert False, f"got non-string name {name} for slot {self}"
-            if yes is not None and yes:
-                # if is_const(name):
+            if is_const(name):
                 name = deconst(name)
                 assert name in consts, f"name {name} not found in consts"
                 return consts[name]
@@ -300,6 +300,34 @@ class SymbolicInstructionSlot:
         if self.dest is not None:
             args = [out_reg] + args
         return self.engine, (op, *args)
+
+    def to_concrete_alu_offload(
+        self,
+        using: dict[str, int],
+        consts: dict[str, int],
+        out_reg: Optional[int] = None,
+    ) -> list[tuple]:
+        assert self.engine == "valu"
+        assert self.op not in ("multiply_add", "vbroadcast")
+        # turn into 8 scalar instructions
+        assert self.dest is not None
+        assert out_reg is not None
+
+        # Translate all input arguments
+        def to_reg(name: str, offset: int) -> int:
+            if is_const(name):
+                name = deconst(name)
+                assert name in consts, f"name {name} not found in consts"
+                return consts[name]
+            assert name in using, f"name {name} not found in using"
+            return using[name] + offset
+
+        def to_inst(offset: int) -> tuple:
+            args = [to_reg(arg, offset) for arg in self.arg_names]
+            # Add dest with offset for each lane
+            return (self.op, out_reg + offset, *args)
+
+        return [to_inst(i) for i in range(8)]
 
 
 def make_slot(
@@ -406,6 +434,8 @@ class FullComputationGraph:
         self.vector_freelist = vector_freelist
         self.consts = consts
         self.refcounts = defaultdict(int)
+        self.distances_to_notable = {}
+        self.__post_init__()
 
     def __post_init__(self):
         assert all(
@@ -413,9 +443,35 @@ class FullComputationGraph:
             for node in self.graph.nodes
         )
         self.prune_noops()
+        # Do a bottom-up BFS to determine distance to notable nodes
+        frontier = set(self.get_stores())
+        for node in frontier:
+            self.distances_to_notable[node] = 0
+        while frontier:
+            next_frontier = set()
+            for node in frontier:
+                # If this is a notable node, we just set to 0
+                if node.is_notable:
+                    self.distances_to_notable[node] = 0
+                else:
+                    # If not notable, find the nearest one. Look at successors, see what their scores are
+                    min_succ_score = float("inf")
+                    for succ in self.graph.successors(node):
+                        if succ in self.distances_to_notable:
+                            min_succ_score = min(
+                                min_succ_score, self.distances_to_notable[succ]
+                            )
+                    self.distances_to_notable[node] = min_succ_score + 1
+                # Move up in the graph (always, not just for non-notable)
+                for pred in self.graph.predecessors(node):
+                    next_frontier.add(pred)
+            frontier = next_frontier
 
     def get_leaves(self) -> list[SymbolicInstructionSlot]:
         return [node for node in self.graph.nodes if self.graph.in_degree(node) == 0]
+
+    def get_stores(self) -> list[SymbolicInstructionSlot]:
+        return [node for node in self.graph.nodes if node.engine == "store"]
 
     def prune_noops(self):
         leaves = self.get_leaves()
@@ -488,11 +544,21 @@ class FullComputationGraph:
             return False
 
         leaves = self.get_leaves()
-        # TODO sort the leaves somehow?
+        # Sort leaves by distance to notable, so we can schedule the ones that are closest to a notable node first. This will hopefully improve load utilization.
+        leaves.sort(key=lambda x: self.distances_to_notable[x])
         for leaf in leaves:
+            alu_offload = False
             if not can_schedule(leaf):
-                # TODO: offload to alu
-                continue
+                if (
+                    leaf.engine == "valu"
+                    and len(bundle["valu"]) == SLOT_LIMITS["valu"]
+                    and len(bundle["alu"]) < SLOT_LIMITS["alu"] - 8
+                    and leaf.op not in ("multiply_add", "vbroadcast")
+                ):
+                    # we can offload to alu!
+                    alu_offload = True
+                else:
+                    continue
 
             # Allocate output register and concrete-ize the slot
             out_reg = None
@@ -503,7 +569,17 @@ class FullComputationGraph:
                 out_reg = self.alloc_outreg(leaf.dest)
 
             # Main logic
-            engine, inst = leaf.to_concrete(self.using, self.consts, out_reg=out_reg)
+            if alu_offload:
+                insts = leaf.to_concrete_alu_offload(
+                    self.using, self.consts, out_reg=out_reg
+                )
+                bundle["alu"].extend(insts)
+            else:
+                engine, inst = leaf.to_concrete(
+                    self.using, self.consts, out_reg=out_reg
+                )
+                assert engine != "NO-OP"
+                bundle[engine].append(inst)
 
             # Reftracking: what slots depend on this one?
             n_forward_deps = self.graph.out_degree(leaf)
@@ -525,9 +601,6 @@ class FullComputationGraph:
                         self.vector_freelist.add(reg)
                     else:
                         self.scalar_freelist.add(reg)
-
-            assert engine != "NO-OP"
-            bundle[engine].append(inst)
 
         return bundle
 

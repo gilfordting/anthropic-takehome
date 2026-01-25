@@ -56,7 +56,14 @@ def constn(n: int) -> str:
 
 
 def is_const(name: str) -> bool:
+    if not isinstance(name, str):
+        return None
     return name.startswith(CONST_PREFIX)
+
+
+def deconst(name: str) -> str:
+    assert is_const(name)
+    return name[len(CONST_PREFIX) :]
 
 
 def vector(name: str) -> str:
@@ -205,14 +212,19 @@ class SymbolicInstructionSlot:
                     assert isinstance(self.arg_names[1], int)
                 elif self.op == "vload":
                     assert is_vector(self.dest), f"dest {self.dest} is not a vector"
-                # else:
-                #     assert is_scalar(self.dest)
-                # if self.op == "load_offset":
-                #     assert len(self.arg_names) == 2
-                # else:
-                #     assert len(self.arg_names) == 1
-                # TODO: mix of concrete value and actual variable names?
-                # TODO: note that our custom ops must be validated here
+                elif self.op == "load":
+                    assert len(self.arg_names) == 1
+                    assert is_scalar(self.arg_names[0])
+                    assert is_scalar(self.dest)
+                elif self.op == "load_offset":
+                    assert len(self.arg_names) == 2
+                    assert is_scalar(self.arg_names[0])
+                    assert isinstance(self.arg_names[1], int)
+                    assert is_scalar(self.dest)
+                else:
+                    assert self.op == "const", f"op {self.op} is not const"
+                    assert is_scalar(self.dest)
+                    assert isinstance(self.arg_names[1], int)
             case "store":
                 assert self.dest is None
                 assert len(self.arg_names) == 2
@@ -246,6 +258,49 @@ class SymbolicInstructionSlot:
     def has_def(self) -> bool:
         return self.dest is not None
 
+    def to_concrete(
+        self,
+        using: dict[str, int],
+        consts: dict[str, int],
+        out_reg: Optional[int] = None,
+    ) -> (Engine, tuple):
+        if self.dest is None:
+            assert out_reg is None
+        else:
+            assert out_reg is not None
+        # Resolution/translation happens here.
+        assert self.engine != "NO-OP"
+        offset = 0
+        arg_names = self.arg_names
+        op = self.op
+        if self.op == "vload_scalar":
+            # Instructions look like this:
+            # vload_scalar partial_treeval_0 val_addrs, 0
+            # Turn into load dest, addr (add the offset to both registers)
+            addr, offset = arg_names
+            out_reg += offset
+            op = "load"
+            arg_names = (addr,)
+
+        def to_reg(name: str) -> int:
+            yes = is_const(name)
+            if yes is None:
+                assert False, f"got non-string name {name} for slot {self}"
+            if yes is not None and yes:
+                # if is_const(name):
+                name = deconst(name)
+                assert name in consts, f"name {name} not found in consts"
+                return consts[name]
+            assert name in using, f"name {name} not found in using"
+            return using[name] + offset
+
+        # Translate all input arguments
+        args = [to_reg(arg) for arg in arg_names]
+        # Add dest
+        if self.dest is not None:
+            args = [out_reg] + args
+        return self.engine, (op, *args)
+
 
 def make_slot(
     op: str, arg_names: list[str], dest: Optional[str] = None
@@ -257,22 +312,6 @@ def make_slot(
         arg_names=tuple(arg_names),
         dest=dest,
     )
-
-
-# also TODO: offload valu to alu slots. Keep in mind this is not possible for vbroadcast or multiply_add
-
-
-# TODO: custom vload_scalar instruction that we need to implement
-# Will be load vload_scalar dst, addrs, offset
-# - dst is a partial variable, a 2-slice of a vector register.
-# - addrs is a vector variable!
-# - offset is a concrete numerical value, one of 0, 2, 4, 6.
-# We'll also have a vmerge instruction, which will take in partial vars and resolve them
-# Semantically, vdst is a vector pair
-# Also need a vmerge instruction -- this is a no-op.
-# So in scheduling, we'll first need to remove all vmerges with resolved dependencies. Then we look at the leaves.
-# The execution engine will need to handle partial variables, and make sure the physical mapping is done correctly.
-# But for the purposes of the computation graph/dependency tracking, these instructions allow us to schedule things properly.
 
 
 # Computation graph of VLIW slots that can be merged with other graphs.
@@ -308,7 +347,7 @@ class ComputationGraph:
                 # We don't need to mark with var name, because it's always the same as the originating node's `dest`
                 self.add_edge(self.inner_defs[arg], slot)
                 continue
-            # Otherwise, we need this variable from outside our graph. Add to external dependencies; we will draw the edge later. TODO
+            # Otherwise, we need this variable from outside our graph. Add to external dependencies; we will draw the edge later.
             self.ext_deps[arg].append(slot)
 
         # if this slot defines a new variable, add to inner_defs
@@ -352,10 +391,156 @@ class ComputationGraph:
 
 
 class FullComputationGraph:
-    def __init__(self, graphs: list[ComputationGraph]):
+    def __init__(
+        self,
+        graphs: list[ComputationGraph],
+        scalar_freelist: set[int],
+        vector_freelist: set[int],
+        consts: dict[str, int],
+    ):
         self.graph = nx.DiGraph()
         for g in graphs:
             self.graph = nx.union(self.graph, g.graph)
+        self.using = {}
+        self.scalar_freelist = scalar_freelist
+        self.vector_freelist = vector_freelist
+        self.consts = consts
+        self.refcounts = defaultdict(int)
+
+    def __post_init__(self):
+        assert all(
+            self.graph.in_degree(node) + self.graph.out_degree(node) > 0
+            for node in self.graph.nodes
+        )
+        self.prune_noops()
+
+    def get_leaves(self) -> list[SymbolicInstructionSlot]:
+        return [node for node in self.graph.nodes if self.graph.in_degree(node) == 0]
+
+    def prune_noops(self):
+        leaves = self.get_leaves()
+        for leaf in leaves:
+            if leaf.engine == "NO-OP":
+                assert leaf.op == "vmerge"
+                # Do the same reftracking stuff -- which slots depend on this one?
+                n_forward_deps = self.graph.out_degree(leaf)
+                assert n_forward_deps > 0
+                assert leaf.dest not in self.refcounts
+                self.refcounts[leaf.dest] = n_forward_deps
+                self.graph.remove_node(leaf)
+
+    @property
+    def has_more_work(self) -> bool:
+        return self.graph.number_of_nodes() > 0
+
+    # Allocate output reg. If partial, allocate only once.
+    def alloc_outreg(self, name: str) -> int:
+        if is_partial(name):
+            name = get_partial_vname(name)
+            if name in self.using:
+                return self.using[name]
+            reg = self.vector_freelist.pop()
+            self.using[name] = reg
+            return reg
+        if is_vector(name):
+            reg = self.vector_freelist.pop()
+            self.using[name] = reg
+            return reg
+        assert is_scalar(name)
+        reg = self.scalar_freelist.pop()
+        self.using[name] = reg
+        return reg
+
+    # Frees the register associated with a given variable name.
+    def free_outreg(self, name: str):
+        # We can't free partial registers; this is fine because the vmerge noop pruning will free the register for us.
+        # The underlying vector register gets allocated when the first vload_scalar is scheduled.
+        # Then vmerge will define the same variable as the partial vars, and everything works!
+        if is_partial(name):
+            assert get_partial_vname(name) in self.using
+            return
+        assert name in self.using
+        if is_vector(name):
+            self.vector_freelist.add(self.using.pop(name))
+            return
+        assert is_scalar(name)
+        self.scalar_freelist.add(self.using.pop(name))
+
+    def schedule(self) -> Instruction:
+        self.prune_noops()
+        assert self.has_more_work
+        bundle = defaultdict(list)
+        seen_dests = set()
+
+        def can_schedule(leaf: SymbolicInstructionSlot) -> bool:
+            if leaf.engine == "alu":
+                return len(bundle["alu"]) < SLOT_LIMITS["alu"]
+            if leaf.engine == "valu":
+                return len(bundle["valu"]) < SLOT_LIMITS["valu"]
+            if leaf.engine == "load":
+                return len(bundle["load"]) < SLOT_LIMITS["load"]
+            if leaf.engine == "store":
+                return len(bundle["store"]) < SLOT_LIMITS["store"]
+            if leaf.engine == "flow":
+                return len(bundle["flow"]) < SLOT_LIMITS["flow"]
+            if leaf.engine == "debug":
+                return len(bundle["debug"]) < SLOT_LIMITS["debug"]
+            return False
+
+        leaves = self.get_leaves()
+        # TODO sort the leaves somehow?
+        for leaf in leaves:
+            if not can_schedule(leaf):
+                # TODO: offload to alu
+                continue
+
+            # Allocate output register and concrete-ize the slot
+            out_reg = None
+            # If we have multiple things defining the same variable, something is wrong
+            if leaf.dest is not None:
+                assert leaf.dest not in seen_dests
+                seen_dests.add(leaf.dest)
+                out_reg = self.alloc_outreg(leaf.dest)
+
+            # Main logic
+            engine, inst = leaf.to_concrete(self.using, self.consts, out_reg=out_reg)
+
+            # Reftracking: what slots depend on this one?
+            n_forward_deps = self.graph.out_degree(leaf)
+            if leaf.dest is not None and n_forward_deps > 0:
+                assert leaf.dest not in self.refcounts, (
+                    f"leaf.dest {leaf.dest} already in refcounts, from leaf {leaf}"
+                )
+                self.refcounts[leaf.dest] = n_forward_deps
+
+            # Remove this leaf, expose more work/leaves
+            self.graph.remove_node(leaf)
+
+            # We can also free registers from our arguments, if refcount reaches 0
+            for arg in leaf.dependencies:
+                self.refcounts[arg] -= 1
+                if self.refcounts[arg] == 0:
+                    reg = self.using.pop(arg)
+                    if is_vector(arg):
+                        self.vector_freelist.add(reg)
+                    else:
+                        self.scalar_freelist.add(reg)
+
+            assert engine != "NO-OP"
+            bundle[engine].append(inst)
+
+        return bundle
+
+    def generate_code(self):
+        code = []
+        orig_sfreelist_len = len(self.scalar_freelist)
+        orig_vfreelist_len = len(self.vector_freelist)
+        while self.has_more_work:
+            bundle = self.schedule()
+            code.append(bundle)
+        assert len(self.scalar_freelist) == orig_sfreelist_len
+        assert len(self.vector_freelist) == orig_vfreelist_len
+        return code
 
 
 def make_hash_graph(
@@ -578,7 +763,6 @@ def make_round2_graph(
 
 
 # with this new system, idx_in and treeval_in for wraparound round should automatically be freed naturally? like they have less edges, so detected automatically
-# TODO check this; should mean idx_in is freed
 def make_wraparound_graph(
     batch: int,
     round: int,
@@ -640,7 +824,7 @@ def make_mid_round_graph(
     treeval_out: str,
 ):
     def vlocalize_rmid(name: str) -> str:
-        return vlocalize(name, batch, 2)
+        return vlocalize(name, batch, round)
 
     def partial(vname, lane_numbers: str) -> str:
         return make_partial(vname, lane_numbers)
@@ -663,8 +847,8 @@ def make_mid_round_graph(
     graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
     graph.add_new_slot("valu+", [vconst("forest_values_p"), idx_out], dest=val_addrs)
 
-    for i, partial in enumerate(partials):
-        graph.add_new_slot("vload_scalar", [val_addrs, i], dest=partial)
+    for i, partial_var in enumerate(partials):
+        graph.add_new_slot("vload_scalar", [val_addrs, i], dest=partial_var)
 
     graph.add_new_slot(
         "vmerge",
@@ -722,7 +906,7 @@ def make_init_load_graph(
         )
         graph.add_new_slot("vload", [curr_addr_out], dest=val_init_out, exports=True)
     else:
-        shifts = calculate_shifts(batch)
+        shifts = calculate_shifts(batch // VLEN)
         if len(shifts) == 1:
             # power of 2 shift
             shift = shifts[0]
@@ -894,13 +1078,21 @@ def make_batch_graph(
 
 # This "compiles" the program
 def make_kernel_graph(
-    forest_height: int, batch_size: int, rounds: int
+    forest_height: int,
+    batch_size: int,
+    rounds: int,
+    scalar_freelist: set[int],
+    vector_freelist: set[int],
+    consts: dict[str, int],
 ) -> FullComputationGraph:
     return FullComputationGraph(
         [
             make_batch_graph(forest_height, rounds, batch)
             for batch in range(0, batch_size, VLEN)
-        ]
+        ],
+        scalar_freelist,
+        vector_freelist,
+        consts,
     )
 
 
@@ -915,14 +1107,25 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
+    def make_bundle(self, **kwargs):
+        vliw_inst = {
+            "alu": kwargs.get("alu", []),
+            "valu": kwargs.get("valu", []),
+            "load": kwargs.get("load", []),
+            "store": kwargs.get("store", []),
+            "flow": kwargs.get("flow", []),
+            "debug": kwargs.get("debug", []),
+        }
+        assert all(
+            len(vliw_inst[engine]) <= SLOT_LIMITS[engine] for engine in vliw_inst
+        ), "instruction exceeded slot limit"
+        return vliw_inst
+
+    def add_bundle(self, **kwargs):
+        self.instrs.append(self.make_bundle(**kwargs))
 
     def add(self, engine, slot):
+        assert engine in ("flow", "debug"), "only flow and debug can be entire cycles"
         self.instrs.append({engine: [slot]})
 
     def alloc_scratch(self, name=None, length=1):
@@ -934,38 +1137,65 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def scratch_const(self, val, name=None):
-        if val not in self.const_map:
-            addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
-            self.const_map[val] = addr
-        return self.const_map[val]
+    def build_const_mapping(self):
+        const_mapping = {}
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
+        # The only const registers we need to retain are:
+        # scalar: forest_values_p, inp_values_p, 01234, s_vlen
+        # vector: 1237, treeval0135791113, diff21, 43, 65, 87, 109, 1211, 1413, hash_mults and hash_adds
 
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(
-                ("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi)))
-            )
+        # Notably:
+        # - forest_values_p and inp_values_p are part of init_vars, can return the other 6 scalar regs
+        # - 7 is loaded in a scalar, we broadcast it, and then can return the scalar reg.
+        # - We load treevals 0-15, compute 7 diffs, and then throw away 2, 4, 6, 8, 10, 12, 14.
+        # hash_adds and hash_mults are loaded in scalars and broadcasted; we can return the scalar regs.
 
-        return slots
+        # Game plan:
+        # Scalar loads: 012347, s_vlen, hash vals
+        # Vector loads: init vars, treevals starting 0 and 8
+        # Vector broadcasts: 1237, treevals 0 to 14, hash vals
+        # vdiffs: diff21, 43, 65, 87, 109, 1211, 1413
 
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
-        """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
-        """
-        make_kernel_graph(forest_height, batch_size, rounds)
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+        # Can throw away:
+        # scalar: 7, init vars except for forest/inp_p, hash vals (?) we might have to come back to this if we want to be able to offload to regular ALU. TODO fix
+        # vector: treeval vectors at 0 and 8 (staging area), vtreeval 2, 4, 8, 12, 14
+
+        # Input is list of (name, concrete value).
+        # We allocate scratch space, load with const, and register in const_mapping.
+        # Returns the loads we need to perform, as a map from name to load instruction.
+        def build_scalar_constants(scalars: list[tuple[str, int]]):
+            loads = {}
+            for name, val in scalars:
+                reg = self.alloc_scratch()
+                loads[name] = ("const", reg, val)
+                assert name not in const_mapping, f"Constant {name} already registered"
+                const_mapping[name] = reg
+            return loads
+
+        SCALARS = list(range(5)) + [7]
+
+        num_loads = build_scalar_constants([(str(i), i) for i in SCALARS])
+        vlen_loads = build_scalar_constants([("s_vlen", VLEN)])
+        hash_add_loads = build_scalar_constants(
+            [(f"hash_add{i}", imm) for i, (_, imm, _, _, _) in enumerate(HASH_STAGES)]
+        )
+        hash_mult_loads = build_scalar_constants(
+            [
+                (f"hash_mult{i}", 1 + 2**shift if i in (0, 2, 4) else shift)
+                for i, (_, _, _, _, shift) in enumerate(HASH_STAGES)
+            ]
+        )
+
+        # Input is list of names and register holding address to load from.
+        # Allocate scratch space, load with vload, and register individual lanes in const_mapping.
+        # Returns the vload to perform.
+        def vload_const_batch(names: list[str], addr_reg: int):
+            assert len(names) <= VLEN, "Too many names for vload_const_batch"
+            base = self.alloc_scratch(length=VLEN)
+            for i, name in enumerate(names):
+                const_mapping[name] = base + i
+            return ("vload", base, addr_reg)
+
         init_vars = [
             "rounds",
             "n_nodes",
@@ -975,83 +1205,209 @@ class KernelBuilder:
             "inp_indices_p",
             "inp_values_p",
         ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        init_vars_vload = vload_const_batch(init_vars, const_mapping["0"])
+        treevals0_vload = vload_const_batch(
+            [f"treeval{i}" for i in range(VLEN)], const_mapping["forest_values_p"]
+        )
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # use 7's reg as scratch after broadcasting and before returning
+        treeval8_addr_calc = (
+            "+",
+            const_mapping["7"],
+            const_mapping["forest_values_p"],
+            const_mapping["s_vlen"],
+        )
+        treevals8_vload = vload_const_batch(
+            [f"treeval{i}" for i in range(VLEN, 2 * VLEN)], const_mapping["7"]
+        )
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
+        # Input is list of (name, reg holding scalar val).
+        # We allocate scratch space, broadcast the scalar, and register in const_mapping.
+        # Returns the broadcasts we need to perform, as a map from name to broadcast instruction.
+        def build_vector_constants(vectors: list[tuple[str, int]]):
+            broadcasts = {}
+            for name, reg in vectors:
+                vbase_reg = self.alloc_scratch(length=VLEN)
+                const_mapping[name] = vbase_reg
+                broadcasts[name] = ("vbroadcast", vbase_reg, reg)
+            return broadcasts
+
+        num_vbroadcasts = build_vector_constants(
+            [(vector(str(i)), const_mapping[str(i)]) for i in (1, 2, 3, 7)]
+        )
+        treeval_vbroadcasts = build_vector_constants(
+            [
+                (vector(f"treeval{i}"), const_mapping[f"treeval{i}"])
+                for i in range(0, VLEN * 2 - 1)
+            ]
+        )
+        hash_add_vbroadcasts = build_vector_constants(
+            [
+                (vector(f"hash_add{i}"), const_mapping[f"hash_add{i}"])
+                for i in range(len(HASH_STAGES))
+            ]
+        )
+        hash_mult_vbroadcasts = build_vector_constants(
+            [
+                (vector(f"hash_mult{i}"), const_mapping[f"hash_mult{i}"])
+                for i in range(len(HASH_STAGES))
+            ]
+        )
+        forest_vals_vbroadcasts = build_vector_constants(
+            [(vector("forest_values_p"), const_mapping["forest_values_p"])]
+        )
+
+        # valu's for diffs
+        vdiff21, vdiff43, vdiff65, vdiff87, vdiff109, vdiff1211, vdiff1413 = [
+            self.alloc_scratch(length=VLEN) for i in range(7)
+        ]
+        vdiff_info = list(
+            zip(
+                [vdiff21, vdiff43, vdiff65, vdiff87, vdiff109, vdiff1211, vdiff1413],
+                [2, 4, 6, 8, 10, 12, 14],
+                [1, 3, 5, 7, 9, 11, 13],
+            )
+        )
+        vdiff_valus = {
+            vector(f"diff{i1}{i2}"): (
+                "-",
+                vreg,
+                const_mapping[vector(f"treeval{i1}")],
+                const_mapping[vector(f"treeval{i2}")],
+            )
+            for vreg, i1, i2 in vdiff_info
+        }
+        for s, (_, vreg, i1, i2) in vdiff_valus.items():
+            const_mapping[s] = vreg
+
+        scalars_to_return = (
+            ["7"]
+            + [s for s in init_vars if s not in ("forest_values_p", "inp_values_p")]
+            + [f"hash_add{i}" for i in range(len(HASH_STAGES))]
+            + [f"hash_mult{i}" for i in range(len(HASH_STAGES))]
+        )
+        scalar_return = {const_mapping.pop(s) for s in scalars_to_return}
+
+        vectors_to_return = ["treeval0", "treeval8"] + [
+            vector(f"treeval{i}") for i in (2, 4, 8, 12, 14)
+        ]
+        vector_return = {const_mapping.pop(v) for v in vectors_to_return}
+        for i in range(1, VLEN):
+            del const_mapping[f"treeval{i}"]
+        for i in range(9, VLEN * 2):
+            del const_mapping[f"treeval{i}"]
+
+        MAX_CYCLES = 20
+        load_bundles = [[] for _ in range(MAX_CYCLES)]
+        valu_bundles = [[] for _ in range(MAX_CYCLES)]
+        alu_bundles = [[] for _ in range(MAX_CYCLES)]
+        # cycle 0: load 0, 7
+        load_bundles[0].extend([num_loads["0"], num_loads["7"]])
+        # cycle 1: vload init vars, s_vlen; vbroadcast 7
+        load_bundles[1].extend([init_vars_vload, vlen_loads["s_vlen"]])
+        valu_bundles[1].extend([num_vbroadcasts[vector("7")]])
+        # cycle 2: vload treevals 0-7, load 1 ; alu 7 = forest_values + s_vlen
+        load_bundles[2].extend([treevals0_vload, num_loads["1"]])
+        alu_bundles[2].extend([treeval8_addr_calc])
+        # cycle 3: vload treevals 8-15, load 2; vbroadcast treevals 0 to 5
+        load_bundles[3].extend([treevals8_vload, num_loads["2"]])
+        valu_bundles[3].extend(
+            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(6)]
+        )
+        # cycle 4: load hashval0, 1; vbroadcast treevals 6 to 11;
+        load_bundles[4].extend([hash_add_loads[f"hash_add{i}"] for i in range(2)])
+        valu_bundles[4].extend(
+            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(6, 12)]
+        )
+        # cycle 5: load hashval2, 3; vbroadcast treevals 12 to 14, valu diff21, 43, 65
+        load_bundles[5].extend([hash_add_loads[f"hash_add{i}"] for i in range(2, 4)])
+        valu_bundles[5].extend(
+            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(12, 15)]
+            + [vdiff_valus[vector(f"diff{i + 1}{i}")] for i in range(1, 6, 2)]  # 1 3 5
+        )
+        # cycle 6: load hashval4, 5; valu diff87, 109, 1211, 1413, vbroadcast 1, 2
+        load_bundles[6].extend([hash_add_loads[f"hash_add{i}"] for i in range(4, 6)])
+        valu_bundles[6].extend(
+            [
+                vdiff_valus[vector(f"diff{i + 1}{i}")] for i in range(7, 14, 2)
+            ]  # 7 9 11 13
+            + [num_vbroadcasts[vector(f"{i}")] for i in range(1, 3)]
+        )
+        # cycle 7: load hash_mult 0, 1; vbroadcast hash_add 0-5
+        load_bundles[7].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2)])
+        valu_bundles[7].extend(
+            [hash_add_vbroadcasts[vector(f"hash_add{i}")] for i in range(6)]
+        )
+        # cycle 8: load hash_mult 2, 3; vbroadcast forest_values_p
+        load_bundles[8].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2, 4)])
+        valu_bundles[8].extend([forest_vals_vbroadcasts[vector("forest_values_p")]])
+        # cycle 9: load hash_mult 4, 5
+        load_bundles[9].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(4, 6)])
+        # cycle 10: load 3, 4; vbroadcast hash_mult 0-5
+        load_bundles[10].extend([num_loads["3"], num_loads["4"]])
+        valu_bundles[10].extend(
+            [hash_mult_vbroadcasts[vector(f"hash_mult{i}")] for i in range(6)]
+        )
+        # cycle 11: vbroadcast 3
+        valu_bundles[11].extend([num_vbroadcasts[vector("3")]])
+
+        setup_cycle_count = 0
+        for load_bundle, valu_bundle, alu_bundle in zip(
+            load_bundles, valu_bundles, alu_bundles
+        ):
+            if load_bundle or valu_bundle:
+                self.add_bundle(load=load_bundle, valu=valu_bundle, alu=alu_bundle)
+                setup_cycle_count += 1
+        return const_mapping, scalar_return, vector_return
+
+    # Make scratch registers. Modifies scratch allocator but does not issue instructions.
+    def make_freelists(self, scalar_return, vector_return):
+        scratch_left = SCRATCH_SIZE - self.scratch_ptr
+        # TODO tune this? each batch is now not limited to 3 scalar registers
+        N_SCALAR_REG = 32 * 3
+        num_extra_scalar = N_SCALAR_REG - len(scalar_return)
+        # take the rest for vector regs
+        num_vector_alloc = (scratch_left - num_extra_scalar) // VLEN
+
+        # Make the freelist. Vector and scalar are separated; TODO can we dynamically promote scalars to vectors?
+        scalar_freelist = set(self.alloc_scratch() for _ in range(num_extra_scalar))
+        scalar_freelist |= scalar_return
+        vector_freelist = set(
+            self.alloc_scratch(length=VLEN) for _ in range(num_vector_alloc)
+        )
+        vector_freelist |= vector_return
+        return scalar_freelist, vector_freelist
+
+    def build_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        # makes constant mappings, as well as instructions for setup phase
+        # this is only 12 cycles; simpler to just have it fully separate. not much overhead
+        consts, scalar_return, vector_return = self.build_const_mapping()
+
+        # make register freelists. this is free (no cycles)
+        scalar_freelist, vector_freelist = self.make_freelists(
+            scalar_return, vector_return
+        )
+        assert all(reg < 1536 for reg in scalar_freelist), (
+            "scalar register is out of bounds"
+        )
+        assert all(reg < 1536 for reg in vector_freelist), (
+            "vector register is out of bounds"
+        )
+        # required to match with reference
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        self.instrs.extend(
+            make_kernel_graph(
+                forest_height,
+                batch_size,
+                rounds,
+                scalar_freelist,
+                vector_freelist,
+                consts,
+            ).generate_code()
+        )
 
-        body = []  # array of slots
-
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
-
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                )
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
-                )
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(
-                    ("debug", ("compare", tmp_node_val, (round, i, "node_val")))
-                )
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                )
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("store", ("store", tmp_addr, tmp_val)))
-
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 

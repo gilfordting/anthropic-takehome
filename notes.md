@@ -516,3 +516,17 @@ what about scalar?
         - hacking to only allocate for first load
     - if we run out of valu slots, can offload one to alu
     - prioritize load > valu > alu?
+
+### custom instructions
+
+Will be load vload_scalar dst, addrs, offset
+
+- dst is a partial variable, a 2-slice of a vector register
+- addrs is a vector variable
+- offset is a concrete numerical value, one of 0, 2, 4, 6
+- We'll also have a vmerge instruction, which will take in partial vars and resolve them
+- Semantically, vdst is a vector pair
+- Also need a vmerge instruction -- this is a no-op
+- So in scheduling, we'll first need to remove all vmerges with resolved dependencies. Then we look at the leaves
+- The execution engine will need to handle partial variables, and make sure the physical mapping is done correctly
+- But for the purposes of the computation graph/dependency tracking, these instructions allow us to schedule things properly

@@ -477,3 +477,22 @@ what about scalar?
 - inp_values_p
 - 1, 01234
 - s_vlen
+
+## even more bottleneck analysis
+
+- the lerp approach trades compute (alu) for memory
+
+## computation graph
+
+- in edges are dependencies, associated with variable names
+- can have multiple outputs, but all outgoing edges have same variable name
+- each individual node is a single slot; this allows parallel processing
+- how to schedule:
+  - look at graph, filter so it's all leaves (no incoming edges)
+  - add that slot to the current instruction; remove all edges and then remove the node from the graph
+  - this is the most general way of scheduling while still allowing for parallelism?
+- how do we track variable lifetimes?
+  - when we remove a node from the graph, we need to count the number of outgoing edges. store in mapping of var name : number of usages
+  - then, every time we schedule an instruction, we go into that mapping and decrement the counter for each variable we use
+  - if it reaches 0, we free it
+  -

@@ -20,6 +20,7 @@ import random
 from typing import Optional
 import unittest
 
+
 from problem import (
     Engine,
     Instruction,
@@ -37,10 +38,120 @@ from problem import (
     reference_kernel2,
 )
 
-
+# Variable naming stuff.
+# Const has precedence over vector. Vector constants are like const vX.
 CONST_PREFIX = "const "
 VECTOR_PREFIX = "v"
 
+
+def const(name: str) -> str:
+    return f"{CONST_PREFIX}{name}"
+
+
+def is_const(name: str) -> bool:
+    return name.startswith(CONST_PREFIX)
+
+
+def is_vector(name: str) -> bool:
+    return (
+        name.startswith(VECTOR_PREFIX)
+        or name.startswith(CONST_PREFIX)
+        and name[len(CONST_PREFIX) :].startswith(VECTOR_PREFIX)
+    )
+
+
+def vector(name: str) -> str:
+    return f"{VECTOR_PREFIX}{name}"
+
+
+def vconst(name: str) -> str:
+    return const(vector(name))
+
+
+# localize a name to a batch and round
+def localize(name: str, batch: int, round: int) -> str:
+    return f"{name}_{batch}_{round}"
+
+
+def batch_localize(name: str, batch: int) -> str:
+    return f"{name}_{batch}"
+
+
+# Must be hashable to be added to DiGraph
+@dataclass(frozen=True)
+class SymbolicInstructionSlot2:
+    engine: Engine
+    op: str
+    # dependencies are all here, minus ones that start with "const_"
+    arg_names: tuple[str, ...]
+    # same role as `defines`, but explicitly separated from arg list
+    dest: Optional[str] = None
+    # always frees these, and adds them to freelist
+    # frees: Optional[set[str]] = None
+    # this is used to offset into a vector reg, if defined
+    vector_offsets: Optional[frozendict[str, int]] = None
+    # batch: int
+    # round: int
+    # comment: str = None
+
+    @property
+    def dependencies(self) -> set[str]:
+        return {arg for arg in self.arg_names if not is_const(arg)}
+
+    @property
+    def has_def(self) -> bool:
+        return self.dest is not None
+
+
+class ComputationGraph:
+    # Allows us to construct a portion of a computation graph that will be merged into a larger graph later.
+    # TODO: handle vector offsets.
+    def __init__(self):
+        self.graph = nx.DiGraph()
+
+        # Temporary staging while we build the graph.
+        self.inner_defs: dict[str, SymbolicInstructionSlot2] = {}
+
+        # Keeps track of external dependencies. Which slots depend on a given outside variable?
+        self.ext_deps: dict[str, list[SymbolicInstructionSlot2]] = defaultdict(list)
+        # Defines what variables we export.
+        self.exports: dict[str, SymbolicInstructionSlot2] = {}
+
+    def add_edge(
+        self, from_node: SymbolicInstructionSlot2, to_node: SymbolicInstructionSlot2
+    ):
+        assert from_node in self.graph, f"originating node {from_node} must be in graph"
+        assert to_node in self.graph, f"destination node {to_node} must be in graph"
+        self.graph.add_edge(from_node, to_node)
+
+    # Must add slots in dependency order.
+    # The last slot added to the graph must be marked. This defines the export.
+    def add_slot(self, slot: SymbolicInstructionSlot2, exports=False):
+        self.graph.add_node(slot)
+
+        # Check that dependencies satisfied, and draw incoming edges
+        for arg in slot.dependencies:
+            # Inner defs take precedence over upper defs
+            if arg in self.inner_defs:
+                # Draw edge from inner def's node to this one
+                # We don't need to mark with var name, because it's always the same as the originating node's `dest`
+                self.add_edge(self.inner_defs[arg], slot)
+                continue
+            # Otherwise, we need this variable from outside our graph. Add to external dependencies; we will draw the edge later. TODO
+            self.ext_deps[arg].append(slot)
+
+        # if this slot defines a new variable, add to inner_defs
+        # inner variables must be unique!
+        if slot.has_def:
+            assert slot.dest not in self.inner_defs, (
+                f"inner variable {slot.dest} is already defined"
+            )
+            self.inner_defs[slot.dest] = slot
+
+        if exports:
+            self.exports[slot.dest] = slot
+
+def make_hash_graph()
 
 # Symbolic structures use names, instead of concrete registers.
 # We can safely instantiate one of these like val = val + 1 and it will automatically add `val` to `frees`, triggering behavior to use different registers.
@@ -104,10 +215,13 @@ class SymbolicInstructionSlot:
                 if self.dest is not None:
                     operands += (self.dest,)
                 assert len(operands) == 3, "alu must have 2 arguments and 1 destination"
-                assert all(not self.is_vector_var(name) for name in operands), (
-                    "alu arguments/destinations must be scalar, instead got: "
-                    + ", ".join(operands)
-                )
+                for name in operands:
+                    if self.is_vector_var(name):
+                        assert name in self.vector_offsets, (
+                            "if vector variable passed to scalar alu, var must be in vector offsets: "
+                            + name
+                        )
+
             case "valu":
                 if self.dest is not None:
                     operands += (self.dest,)
@@ -293,29 +407,45 @@ class SymbolicBundle:
         # make the out mapping: take stuff from freelist and use it for destinations
         # also keep track of which slot it came from
         out_mapping = {}
+
+        # Figure out how to make things compatible with vector offsets?
+        # Main use cases: loading to a vector offset for the main scalar loads
+        # make mid round: using a specific position within a vector for scalar alu op; loading to a position within an existing vector
+        # Goal: allow using scalar engine with vector offsets, for both input and output
+
+        # Generally, this does the following:
+        # Allocate *new* registers for outputs.
+        # Pass these to individual slots for concrete-izing.
+        # Remove freed registers from `using`, and put them on the freelist.
+        # Add out_mapping to `using`.
+
+        reg_slots = []
+        vector_offset_slots = []
         for i, slot in enumerate(self.slots):
             if slot.dest is not None:
-                # Must make this compatible with vector offsets
                 if slot.dest in slot.vector_offsets:
-                    assert slot.op == "load", (
-                        "vector offsets can only be used with load dest"
-                    )
-                    # If loading to a vector offset, we don't load to a new register.
-                    # We must use an existing register.
-                    assert slot.dest in using, (
-                        "If loading to vector offset, dest must already exist"
-                    )
-                    out_mapping[slot.dest] = (
-                        using[slot.dest],
-                        i,
-                    )
-                    continue
-                freelist = scalar_freelist if slot.is_scalar else vector_freelist
-                assert len(freelist) > 0, (
-                    f"freelist is empty for slot {i}, which is batch {slot.batch} and round {slot.round}; it is scalar: {slot.is_scalar}"
-                )
+                    vector_offset_slots.append((i, slot))
+                else:
+                    reg_slots.append((i, slot))
 
-                out_mapping[slot.dest] = (freelist.pop(), i)
+        for i, slot in reg_slots:
+            # Always allocate a new register for the destination, if reg slot
+            freelist = scalar_freelist if slot.is_scalar else vector_freelist
+            assert len(freelist) > 0, (
+                f"freelist is empty for slot {i}, which is batch {slot.batch} and round {slot.round}; it is scalar: {slot.is_scalar}"
+            )
+            out_mapping[slot.dest] = (freelist.pop(), i)
+
+        vector_offset_dests = {}
+        for i, slot in vector_offset_slots:
+            if slot.dest not in vector_offset_dests:
+                vector_offset_dests[slot.dest] = i
+                if slot.dest not in using:
+                    freelist = scalar_freelist if slot.is_scalar else vector_freelist
+                    out_mapping[slot.dest] = (freelist.pop(), i)
+                else:
+                    out_mapping[slot.dest] = (using[slot.dest], i)
+
         assert all(reg < 1536 for reg, _ in out_mapping.values()), (
             "register is out of bounds"
         )
@@ -503,6 +633,7 @@ def single_bundle(
 def multi_bundle(*args: SymbolicBundle) -> SymbolicBundle:
     return SymbolicBundle(slots=sum([bundle.slots for bundle in args], []))
 
+
 @dataclass
 class VLIWScheduler:
     progs: list[SymbolicProgram]
@@ -555,8 +686,6 @@ class VLIWScheduler:
         assert len(vector_freelist) == len(old_vector_freelist)
         assert all(i in old_vector_freelist for i in vector_freelist)
         assert len(scalar_freelist) == len(old_scalar_freelist)
-        # some error margin allowed for scalar freelist (addresses)?
-        # assert abs(len(scalar_freelist) - len(old_scalar_freelist)) < 4
         assert all(i in old_scalar_freelist for i in scalar_freelist)
         return insts
 
@@ -564,39 +693,6 @@ class VLIWScheduler:
         # we want to make sure load is utilized, so prioritize those.
         # but we also don't want to get stuck in a state where we just stop after the last load, and then never actually do the store.
 
-        # sort by dist_to_load, then dist_to_scalar_load
-        # self.progs.sort(key=lambda x: (x.dist_to_load, x.dist_to_scalar_load))
-        # return [
-        #     prog.to_concrete(using, scalar_freelist, vector_freelist, consts)
-        #     for prog in self.progs
-        # ]
-
-def const(name: str) -> str:
-    return f"{CONST_PREFIX}{name}"
-
-
-def vector(name: str) -> str:
-    return f"{VECTOR_PREFIX}{name}"
-
-def vconst(name: str) -> str:
-    return const(vector(name))
-
-
-# localize a name to a batch and round
-def localize(name: str, batch: int, round: int) -> str:
-    return f"{name}_{batch}_{round}"
-
-
-def batch_localize(name: str, batch: int) -> str:
-    return f"{name}_{batch}"
-
-
-# all symbolic instructions needs to provide this info
-# if a name is used for dest, does not need to be provided in `frees`
-# op: str,
-# arg_names: list[str],
-# dest: Optional[str] = None,
-# frees: Optional[set[str]] = None,
 
 def calculate_shifts(batch: int) -> list[int]:
     factor = batch // VLEN
@@ -1055,7 +1151,6 @@ def make_round2(
                 op="multiply_add",
                 arg_names=[bit0, vconst("diff87"), vconst("treeval7")],
                 dest=lerp87,
-                frees={bit0},
             ),
             single_bundle(
                 batch=batch,
@@ -1063,7 +1158,6 @@ def make_round2(
                 op="multiply_add",
                 arg_names=[bit0, vconst("diff109"), vconst("treeval9")],
                 dest=lerp109,
-                frees={bit0},
             ),
             single_bundle(
                 batch=batch,
@@ -1385,6 +1479,130 @@ def make_mid_round(
     return bundles
 
 
+def make_mid_round_bad(
+    val_name: str,
+    idx_name: str,
+    treeval_name: str,
+    batch: int,
+    round: int,
+    rounds: int,
+    forest_height: int,
+) -> list[SymbolicBundle]:
+    bundles = []
+    inX = vector(localize("inX", batch, round))
+    parityX = vector(localize("parityX", batch, round))
+    val_addrs = vector(localize("val_addrs", batch, round))
+    bundles.append(
+        single_bundle(
+            batch=batch,
+            round=round,
+            op="valu^",
+            arg_names=[val_name, treeval_name],
+            dest=inX,
+            frees={val_name},  # don't free treeval, because it's used for gather
+        )
+    )
+    bundles.extend(make_hash(inX, val_name, batch, round))
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu%",
+                arg_names=[val_name, vconst("2")],
+                dest=parityX,
+            ),
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="multiply_add",
+                arg_names=[vconst("2"), idx_name, vconst("1")],
+                dest=idx_name,
+            ),
+        )
+    )
+    bundles.append(
+        multi_bundle(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="valu+",
+                arg_names=[idx_name, parityX],
+                dest=idx_name,
+                frees={parityX},
+            ),
+        )
+    )
+    # gather
+    # first calc address, vectorized
+    frees = set()
+    next_round_is_wraparound = (round + 2) % (forest_height + 1) == 0
+    next_round_is_last = round + 1 == rounds - 1
+    if next_round_is_wraparound or next_round_is_last:
+        frees.add(idx_name)
+    bundles.append(
+        multi_bundle(
+            *[
+                single_bundle(
+                    batch=batch,
+                    round=round,
+                    op="+",
+                    arg_names=[const("forest_values_p"), idx_name],
+                    dest=val_addrs,
+                    frees=frees,
+                    vector_offsets={val_addrs: i, idx_name: i},
+                )
+                for i in range(VLEN)
+            ]
+        )
+    )
+    # then we do loads
+    # offset in val_addrs and treeval_name
+    # for i in range(0, VLEN, 2):
+    #     frees = set()
+    #     if i == VLEN - 2:
+    #         frees.add(val_addrs)
+    #     bundles.append(
+    #         multi_bundle(
+    #             single_bundle(
+    #                 batch=batch,
+    #                 round=round,
+    #                 op="load",
+    #                 arg_names=[val_addrs],
+    #                 dest=treeval_name,
+    #                 vector_offsets={treeval_name: i, val_addrs: i},
+    #                 frees=frees,
+    #             ),
+    #             single_bundle(
+    #                 batch=batch,
+    #                 round=round,
+    #                 op="load",
+    #                 arg_names=[val_addrs],
+    #                 dest=treeval_name,
+    #                 vector_offsets={treeval_name: i + 1, val_addrs: i + 1},
+    #                 frees=frees,
+    #             ),
+    #         )
+    #     )
+    for i in range(VLEN):
+        frees = set()
+        if i == VLEN - 1:
+            frees.add(val_addrs)
+        bundles.append(
+            single_bundle(
+                batch=batch,
+                round=round,
+                op="load",
+                arg_names=[val_addrs],
+                dest=treeval_name,
+                vector_offsets={treeval_name: i, val_addrs: i},
+                frees=frees,
+            )
+        )
+
+    return bundles
+
+
 def make_batch_insts(
     batch: int, rounds: int, forest_height: int
 ) -> list[SymbolicBundle]:
@@ -1423,7 +1641,15 @@ def make_batch_insts(
             )
         else:
             bundles.extend(
-                make_mid_round(val_name, idx_name, treeval_name, batch, round, rounds)
+                make_mid_round_bad(
+                    val_name,
+                    idx_name,
+                    treeval_name,
+                    batch,
+                    round,
+                    rounds,
+                    forest_height,
+                )
             )
     return bundles
 
@@ -1586,6 +1812,9 @@ class KernelBuilder:
                 for i in range(len(HASH_STAGES))
             ]
         )
+        forest_vals_vbroadcasts = build_vector_constants(
+            [("vforest_values_p", const_mapping["forest_values_p"])]
+        )
 
         # valu's for diffs
         vdiff21, vdiff43, vdiff65, vdiff87, vdiff109, vdiff1211, vdiff1413 = [
@@ -1664,8 +1893,9 @@ class KernelBuilder:
         valu_bundles[7].extend(
             [hash_add_vbroadcasts[f"vhash_add{i}"] for i in range(6)]
         )
-        # cycle 8: load hash_mult 2, 3
+        # cycle 8: load hash_mult 2, 3; vbroadcast forest_values_p
         load_bundles[8].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2, 4)])
+        valu_bundles[8].extend([forest_vals_vbroadcasts["vforest_values_p"]])
         # cycle 9: load hash_mult 4, 5
         load_bundles[9].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(4, 6)])
         # cycle 10: load 3, 4; vbroadcast hash_mult 0-5

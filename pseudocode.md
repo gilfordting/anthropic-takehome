@@ -3,7 +3,9 @@
 ## hash
 
 ```asm
-hash(in, out): (frees in, defines out)
+in: val_in
+out: val_out
+hash(val_in, out): (frees in, defines out)
 # iter 0
 valu multiply_add in <- in, vhash_mult0, vhash_add0  # iter0
 
@@ -33,32 +35,37 @@ valu op2 out <- tmp1, tmp2; frees tmp1, tmp2
 
 ### round 0
 
+in: val_in
+out: val_out, idx_out, treeval_out
+
 ```asm
-valu ^ in0 <- val, const vtreeval0; frees val
-...val = hash(in0)
-valu % parity0 <- val, const v2
-@parallel
-    valu + idx <- parity0, const v1
-    valu multiply_add treeval <- parity0, const vdiff21, const vtreeval1
+hash_in = val_in ^ const_v treeval0
+...val_out = hash(in0)
+parity = val_out % 2
+idx = parity + v1
+treeval = parity * const_v diff21 + const_v treeval1
 ```
 
 ### round 1
 
 ```asm
-valu ^ in1 <- val, treeval; frees val, treeval
-...val = hash(in1)
-valu multiply_add idx_name <- const v2, idx_name, const v1
-@parallel
-    valu % parity1 <- val, const v2
-    valu - upperbit1 <- idx_name, const v3
-@parallel
-    valu multiply_add diff1 <- parity1, const vdiff43, const vtreeval3; frees parity1
-    valu multiply_add diff2 <- parity1, const vdiff65, const vtreeval5; frees parity1
-    valu + idx <- idx, parity1; frees parity1
-@parallel
-    valu - ddiff <- diff2, diff1; frees diff2
-    valu >> upperbit1 <- upperbit1, const v1
-valu multiply_add treeval <- upperbit1, ddiff, diff1
+in: val_in, idx_in, treeval_in
+out: val_out, idx_out, treeval_out
+
+
+hash_in = val_in ^ treeval_in
+...val_out = hash(hash_in)
+idx_tmp = 2 * idx_in + 1
+parity = val_out % 2
+idx_out = idx_tmp + parity
+norm_idx = idx_out - 3
+bit0 = norm_idx & 1
+norm_idx_down1 = norm_idx >> 1
+bit1 = norm_idx_down1 & 1
+lerp43 = bit0 * const_v diff43 + const_v treeval3
+lerp65 = bit0 * const_v diff65 + const_v treeval5
+ddiff6543 = lerp65 - lerp43
+treeval_out = bit1 * ddiff6543 + lerp43
 ```
 
 ### round 2
@@ -66,82 +73,153 @@ valu multiply_add treeval <- upperbit1, ddiff, diff1
 [scratch](https://docs.google.com/spreadsheets/d/1PiXPo-L16TS667PRALQBl8A0-6l5BOEvm7pL1Kl1PI4/edit?gid=0#gid=0)
 
 ```asm
-hash_in = val ^ treeval; frees val, treeval
-...val = hash(hash_in); frees in1
-@parallel
-    idx = 2*idx + 1
-    parity = val % 2
+in: val_in, idx_in, treeval_in
+out: val_out, idx_out, treeval_out
 
-idx += parity; frees parity
+hash_in = val_in ^ treeval_in
+...val_out = hash(hash_in); export val_out
+idx_tmp = 2*idx_in + 1
+parity = val_out % 2
+idx_out = idx_tmp + parity
+norm_idx = idx_out - 7
+norm_idx_down1 = norm_idx >> 1
+norm_idx_down2 = norm_idx >> 2
+bit0 = norm_idx & 1
+bit1 = norm_idx_down1 & 1
+bit2 = norm_idx_down2 & 1
 
-@parallel
-    norm_idx = idx - 7
+lerp87 = bit0 * vconst diff87 + vconst treeval7
+lerp109 = bit0 * vconst diff109 + vconst treeval9
+lerp1211 = bit0 * vconst diff1211 + vconst treeval11
+lerp1413 = bit0 * vconst diff1413 + vconst treeval13
+ddiff10987 = lerp109 - lerp87
+ddiff14131211 = lerp1413 - lerp1211
 
-@parallel
-    bit0 = norm_idx & 1
-    norm_idx >>= 1
+lerp10987 = bit1 * ddiff10987 + lerp87
+lerp14131211 = bit1 * ddiff14131211 + lerp1211
+dddiff147 = lerp14131211 - lerp10987
 
-@parallel
-    lerp87 = bit0 \* diff87 + vtree7; frees bit0
-    lerp109 = bit0 \* diff109 + vtree9; frees bit0
-    lerp1211 = bit0 \* diff1211 + vtree11; frees bit0
-    lerp1413 = bit0 \* diff1413 + vtree13; frees bit0
-
-@parallel
-    bit1 = norm_idx & 1
-    norm_idx >>= 1
-    ddiff10987 = lerp109 - lerp87; frees lerp109
-    ddiff14131211 = lerp1413 - lerp1211; frees lerp1413
-
-@parallel
-    lerp10987 = bit1 \* ddiff10987 + lerp87; frees bit1, lerp87, ddiff10987
-    lerp14131211 = bit1 \* ddiff14131211 + lerp1211; frees bit1, lerp1211, ddiff14131211
-
-@parallel
-    bit2 = norm_idx & 1; frees: norm_idx
-    dddiff147 = lerp14131211 - lerp10987; frees lerp14131211
-
-@parallel
-    treeval = bit2 \* dddiff147 + lerp10987; frees bit2, dddiff147, lerp10987
+treeval_out = bit2 * dddiff147 + lerp10987
 ```
 
 ### wraparound
 
 ```asm
-valu ^ in_wrap <- val, treeval; frees val, treeval
-...val = hash(in_wrap)
+in: val_in, treeval_in
+out: val_out
+
+hash_in = val_in ^ treeval_in
+...val_out = hash(hash_in); export val_out
 ```
 
 ### last
 
 ```asm
-valu ^ in_last <- val, treeval; frees val, treeval
-...val = hash(in_last)
-vstore curr_addr, val; frees val
-if not last batch: @static
-    vload next_val_name, next_addr
+in: val_in, treeval_in, curr_addr_in
+out: none, no exports
+
+hash_in = val_in ^ treeval_in
+...val_final = hash(hash_in)
+vstore curr_addr_in, val_final; no dest
 ```
 
 ### mid
 
 ```asm
-valu ^ inX <- val, treeval; frees val
-...val = hash(inX)
-@parallel
-    valu % parityX <- val, const v2
-    valu multiply_add idx <- vconst 2, idx, vconst 1
-valu + idx <- idx, parityX; frees parityX
-# gather
-# prologue
-alu + tmp_addr <- const forest_values_p, idx[0]
-# round i [1, VLEN)
-@parallel
-    + tmp_addr <- const forest_values_p, idx[i]; frees idx (if next round is wraparound, or next round is last. also must be last round)
-    load treeval[i-1] tmp_addr; frees tmp_addr
-# epilogue
-load treeval[VLEN-1] tmp_addr; frees tmp_addr
+in: val_in, idx_in, treeval_in
+out: val_out, idx_out, treeval_out
+
+hash_in = val_in ^ treeval_in
+...val_out = hash(hash_in); export val_out
+idx_tmp = 2 * idx_in + 1
+parity = val_out % 2
+idx_out = idx_tmp + parity
+val_addrs = vconst forest_values_p + idx_out
+
+vload_scalar partial_treeval_0 val_addrs, 0
+vload_scalar partial_treeval_1 val_addrs, 1
+vload_scalar partial_treeval_2 val_addrs, 2
+vload_scalar partial_treeval_3 val_addrs, 3
+vload_scalar partial_treeval_4 val_addrs, 4
+vload_scalar partial_treeval_5 val_addrs, 5
+vload_scalar partial_treeval_6 val_addrs, 6
+vload_scalar partial_treeval_7 val_addrs, 7
+
+vmerge treeval_out, partial_treeval_0, partial_treeval_1, partial_treeval_2, partial_treeval_3, partial_treeval_4, partial_treeval_5, partial_treeval_6, partial_treeval_7
+```
+
+## initial load
+
+```asm
+out: curr_addr_out, treeval_out
+
+(batch' = batch / 8)
+
+if batch' is 0:
+    vload treeval_out, const inp_values_p
+if batch' is 1:
+    curr_addr_out = const inp_values_p + s_vlen
+    vload treeval_out, curr_addr_out
+
+if batch' is a power of 2 (only 1 shift):
+    tmp_offset0 = 1 << tmp_shift
+    tmp_offset_final = s_vlen * tmp_offset0
+    curr_addr_out = const inp_values_p + tmp_offset_final
+    vload treeval_out, curr_addr_out
+
+if 2 shifts:
+    tmp_offset0 = 1 << shift0
+    tmp_offset1 = 1 << shift1
+
+    tmp_offset_sum0 = tmp_offset0 + tmp_offset1
+    tmp_offset_final = s_vlen * tmp_offset_sum0
+    curr_addr_out = const inp_values_p + tmp_offset_final
+    vload treeval_out, curr_addr_out
+
+if 3 shifts:
+    tmp_offset0 = 1 << shift0
+    tmp_offset1 = 1 << shift1
+    tmp_offset2 = 1 << shift2
+
+    tmp_offset_sum0 = tmp_offset0 + tmp_offset1
+    tmp_offset_sum1 = tmp_offset_sum0 + tmp_offset2
+    tmp_offset_final = s_vlen * tmp_offset_sum1
+    curr_addr_out = const inp_values_p + tmp_offset_final
+    vload treeval_out, curr_addr_out
+
+if 4 shifts:
+    tmp_offset0 = 1 << shift1
+    tmp_offset1 = 1 << shift2
+    tmp_offset2 = 1 << shift3
+    tmp_offset3 = 1 << shift4
+
+    tmp_offset_sum0 = tmp_offset0 + tmp_offset1
+    tmp_offset_sum1 = tmp_offset2 + tmp_offset3
+    tmp_offset_sum2 = tmp_offset_sum0 + tmp_offset_sum1
+    tmp_offset_final = s_vlen * tmp_offset_sum2
+    curr_addr_out = const inp_values_p + tmp_offset_final
+    vload treeval_out, curr_addr_out
+
+if 5 shifts:
+    tmp_offset0 = 1 << shift1
+    tmp_offset1 = 1 << shift2
+    tmp_offset2 = 1 << shift3
+    tmp_offset3 = 1 << shift4
+    tmp_offset4 = 1 << shift5
+
+    tmp_offset_sum0 = tmp_offset0 + tmp_offset1
+    tmp_offset_sum1 = tmp_offset2 + tmp_offset3
+    tmp_offset_sum2 = tmp_offset_sum0 + tmp_offset_sum1
+    tmp_offset_sum3 = tmp_offset_sum2 + tmp_offset4
+    tmp_offset_final = s_vlen * tmp_offset_sum3
+    curr_addr_out = const inp_values_p + tmp_offset_final
+    vload treeval_out, curr_addr_out
 ```
 
 ## main
+
+```asm
+curr_addr, val_init = ...init_load()
+```
 
 build constants first

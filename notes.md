@@ -495,4 +495,20 @@ what about scalar?
   - when we remove a node from the graph, we need to count the number of outgoing edges. store in mapping of var name : number of usages
   - then, every time we schedule an instruction, we go into that mapping and decrement the counter for each variable we use
   - if it reaches 0, we free it
+
+## backend
+
+- similar to what we had before
+  - register lifetime logic above
+- need to implement the two custom instructions
+  - vload_scalars
+  - vmerge
+- also offload to scalar ALU slots if available
+- still have the depth-based heuristic?
+
+### design
+
+- first, get rid of vmerge noops
+- look at all of the leaves
+  - greedily put them into available slots
   -

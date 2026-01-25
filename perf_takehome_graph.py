@@ -19,12 +19,11 @@ We recommend you look through problem.py next.
 from collections import defaultdict
 from dataclasses import dataclass
 import random
-from typing import Optional
+from typing import Literal, Optional
 import unittest
 import networkx as nx
 
 from problem import (
-    Engine,
     Instruction,
     DebugInfo,
     SLOT_LIMITS,
@@ -39,6 +38,8 @@ from problem import (
     build_mem_image,
     reference_kernel2,
 )
+
+Engine = Literal["alu", "valu", "load", "store", "flow", "debug", "NO-OP"]
 
 # Variable naming stuff.
 # Const has precedence over vector. Vector constants are like const vX.
@@ -83,7 +84,8 @@ def make_partial(vname: str, lane_number: int) -> str:
 
 def get_partial_vname(name: str) -> str:
     assert is_partial(name)
-    return name.split("_")[1]
+    # get rid of prefix and lane number
+    return "_".join(name.split("_")[1:-1])
 
 
 def is_partial(name: str) -> bool:
@@ -201,10 +203,6 @@ class SymbolicInstructionSlot:
                     assert len(self.arg_names) == 2
                     assert is_vector(self.arg_names[0])
                     assert isinstance(self.arg_names[1], int)
-                elif self.op == "vmerge":
-                    assert len(self.arg_names) == 8
-                    assert all(is_partial(arg) for arg in self.arg_names)
-                    assert is_vector(self.dest)
                 elif self.op == "vload":
                     assert is_vector(self.dest), f"dest {self.dest} is not a vector"
                 # else:
@@ -225,6 +223,13 @@ class SymbolicInstructionSlot:
                     assert is_scalar(self.arg_names[1])
             case "flow":
                 assert self.op == "pause"
+            case "NO-OP":
+                assert len(self.arg_names) == 8
+                assert all(is_partial(arg) for arg in self.arg_names)
+                names = [get_partial_vname(arg) for arg in self.arg_names]
+                names_set = set(names)
+                assert len(names_set) == 1  # should all have the same vname
+                assert names_set.pop() == self.dest
             case "debug":
                 # anything works
                 return
@@ -637,15 +642,15 @@ def make_mid_round_graph(
     def vlocalize_rmid(name: str) -> str:
         return vlocalize(name, batch, 2)
 
-    def localize_partial(vname, lane_numbers: str) -> str:
-        return localize(make_partial(vname, lane_numbers), batch, round)
+    def partial(vname, lane_numbers: str) -> str:
+        return make_partial(vname, lane_numbers)
 
     hash_in = vlocalize_rmid("hash_in")
     parity = vlocalize_rmid("parity")
     idx_tmp = vlocalize_rmid("idx_tmp")
     val_addrs = vlocalize_rmid("val_addrs")
     # partials
-    partials = [localize_partial(treeval_out, i) for i in range(8)]
+    partials = [partial(treeval_out, i) for i in range(8)]
 
     graph = ComputationGraph()
     graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)

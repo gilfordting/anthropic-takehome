@@ -68,6 +68,28 @@ ddiff6543 = lerp65 - lerp43
 treeval_out = bit1 * ddiff6543 + lerp43
 ```
 
+### round 1, draft 2
+
+```asm
+in: val_in, idx_in, treeval_in
+out: val_out, idx_out, treeval_out
+
+
+hash_in = val_in ^ treeval_in
+...val_out = hash(hash_in)
+idx_tmp = 2 * idx_in + 1
+parity = val_out % 2
+idx_out = idx_tmp + parity
+norm_idx = idx_out - 3
+bit0 = norm_idx & 1
+norm_idx_down1 = norm_idx >> 1
+bit1 = norm_idx_down1 & 1
+
+sel43 = bit0 ? vconst treeval4 : vconst treeval3
+sel65 = bit0 ? vconst treeval16 : vconst treeval5
+treeval_out = bit1 ? sel65 : sel43
+```
+
 ### round 2
 
 [scratch](https://docs.google.com/spreadsheets/d/1PiXPo-L16TS667PRALQBl8A0-6l5BOEvm7pL1Kl1PI4/edit?gid=0#gid=0)
@@ -100,6 +122,77 @@ lerp14131211 = bit1 * ddiff14131211 + lerp1211
 dddiff147 = lerp14131211 - lerp10987
 
 treeval_out = bit2 * dddiff147 + lerp10987
+```
+
+### round 2, draft 2
+
+```asm
+in: val_in, idx_in, treeval_in
+out: val_out, idx_out, treeval_out
+
+hash_in = val_in ^ treeval_in
+...val_out = hash(hash_in); export val_out
+idx_tmp = 2*idx_in + 1
+parity = val_out % 2
+idx_out = idx_tmp + parity
+norm_idx = idx_out - 7
+norm_idx_down1 = norm_idx >> 1
+norm_idx_down2 = norm_idx >> 2
+bit0 = norm_idx & 1
+bit1 = norm_idx_down1 & 1
+bit2 = norm_idx_down2 & 1
+
+sel87 = bit0 ? vconst treeval8 : vconst treeval7
+sel109 = bit0 ? vconst treeval10 : vconst treeval9
+sel1211 = bit0 ? vconst treeval12 : vconst treeval11
+sel1413 = bit0 ? vconst treeval14 : vconst treeval13
+
+sel10987 = bit1 ? sel109 : sel87
+sel14131211 = bit1 ? sel1413 : sel1211
+
+treeval_out = bit2 ? sel14131211 : sel10987
+```
+
+### round 3
+
+```asm
+in: val_in, idx_in, treeval_in
+out: val_out, idx_out, treeval_out
+
+hash_in = val_in ^ treeval_in
+...val_out = hash(hash_in); export val_out
+idx_tmp = 2*idx_in + 1
+parity = val_out % 2
+idx_out = idx_tmp + parity
+norm_idx = idx_out - 15
+norm_idx_down1 = norm_idx >> 1
+norm_idx_down2 = norm_idx >> 2
+norm_idx_down3 = norm_idx >> 3
+bit0 = norm_idx & 1
+bit1 = norm_idx_down1 & 1
+bit2 = norm_idx_down2 & 1
+bit3 = norm_idx_down3 & 1
+
+15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30
+
+sel1615 = bit0 ? vconst treeval16 : vconst treeval15
+sel1817 = bit0 ? vconst treeval18 : vconst treeval17
+sel2019 = bit0 ? vconst treeval20 : vconst treeval19
+sel2221 = bit0 ? vconst treeval22 : vconst treeval21
+sel2423 = bit0 ? vconst treeval24 : vconst treeval22
+sel2625 = bit0 ? vconst treeval26 : vconst treeval25
+sel2827 = bit0 ? vconst treeval28 : vconst treeval27
+sel3029 = bit0 ? vconst treeval30 : vconst treeval29
+
+sel1815 = bit1 ? vconst sel1817 : vconst sel1615
+sel2219 = bit1 ? vconst sel2221 : vconst sel2019
+sel2623 = bit1 ? vconst sel2625 : vconst sel2423
+sel3027 = bit1 ? vconst sel3029 : vconst sel2827
+
+sel2215 = bit2 ? vconst sel2219 : vconst sel1815
+sel3023 = bit2 ? vconst sel3027 : vconst sel2623
+
+treeval_out = bit3 ? sel3023 : sel2215
 ```
 
 ### wraparound
@@ -223,3 +316,17 @@ curr_addr, val_init = ...init_load()
 ```
 
 build constants first
+
+### alu half-offloading
+
+```asm
+(valu) dest = a1 op a2
+becomes
+valu_scalar partial_dest_0 op a1, a2, 0
+valu_scalar partial_dest_1 op, a1, a2, 1
+...
+valu_scalar op partial_dest_7 a1, a2, 7
+vmerge dest, op partial_dest_0, partial_dest_1, partial_dest_2, partial_dest_3, partial_dest_4, partial_dest_5, partial_dest_6, partial_dest_7
+```
+
+check that vmerge works fine as well

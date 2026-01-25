@@ -82,6 +82,7 @@ def is_vector(name: str) -> bool:
 # - input to vmerge custom instruction
 # partial vars must have a corresponding vector var `v` if they're used as args; will be created only once if used as the dest.
 # will be in the format partial_<v's name>_<lane number>
+# also used for alu half-offloading
 PARTIAL_PREFIX = "partial_"
 
 
@@ -138,6 +139,8 @@ def infer_engine(op: str) -> (Engine, str):
         engine = "NO-OP"
     elif op == "vload_scalar":
         engine = "load"
+    elif op == "valu_scalar":
+        engine = "alu"
     elif "load" in op or "const" in op:
         engine = "load"
     elif "store" in op:
@@ -189,13 +192,19 @@ class SymbolicInstructionSlot:
     def __post_init__(self):
         match self.engine:
             case "alu":
+                assert self.dest is not None
+                if self.op == "valu_scalar":
+                    assert is_partial(self.dest), f"dest {self.dest} is not a partial"
+                    assert len(self.arg_names) == 4
+                    assert isinstance(self.arg_names[0], str)
+                    assert all(is_vector(arg) for arg in self.arg_names[1:3])
+                    assert isinstance(self.arg_names[3], int)
                 assert all(is_scalar(arg) for arg in self.arg_names)
                 assert len(self.arg_names) == 2
-                assert self.dest is not None and is_scalar(self.dest)
+                assert is_scalar(self.dest)
             case "valu":
-                assert self.dest is not None and is_vector(self.dest), (
-                    f"dest {self.dest} is not a vector"
-                )
+                assert self.dest is not None
+                assert is_vector(self.dest), f"dest {self.dest} is not a vector"
                 if self.op == "vbroadcast":
                     assert len(self.arg_names) == 1
                     assert is_scalar(self.arg_names[0])
@@ -234,7 +243,7 @@ class SymbolicInstructionSlot:
                 else:
                     assert is_scalar(self.arg_names[1])
             case "flow":
-                assert self.op == "pause"
+                assert self.op in ("pause", "vselect")
             case "NO-OP":
                 assert len(self.arg_names) == 8
                 assert all(is_partial(arg) for arg in self.arg_names)
@@ -285,6 +294,14 @@ class SymbolicInstructionSlot:
             out_reg += offset
             op = "load"
             arg_names = (addr,)
+
+        if self.op == "valu_scalar":
+            # Instructions look like this:
+            # valu_scalar partial_dest_0 op a1, a2, 0
+            # Turn into alu op dest, a1, a2 (add the offset to both registers)
+            op, a1, a2, offset = arg_names
+            out_reg += offset
+            arg_names = (a1, a2)
 
         def to_reg(name: str) -> int:
             if is_const(name):
@@ -548,15 +565,21 @@ class FullComputationGraph:
         leaves.sort(key=lambda x: self.distances_to_notable[x])
         for leaf in leaves:
             alu_offload = False
+            alu_half_offload = False
             if not can_schedule(leaf):
                 if (
                     leaf.engine == "valu"
                     and len(bundle["valu"]) == SLOT_LIMITS["valu"]
-                    and len(bundle["alu"]) < SLOT_LIMITS["alu"] - 8
                     and leaf.op not in ("multiply_add", "vbroadcast")
                 ):
-                    # we can offload to alu!
-                    alu_offload = True
+                    if len(bundle["alu"]) < SLOT_LIMITS["alu"] - 8:
+                        # we can offload to alu!
+                        alu_offload = True
+                    elif len(bundle["alu"]) < SLOT_LIMITS["alu"] - 4:
+                        alu_half_offload = True
+                        continue
+                    else:
+                        continue
                 else:
                     continue
 
@@ -574,6 +597,13 @@ class FullComputationGraph:
                     self.using, self.consts, out_reg=out_reg
                 )
                 bundle["alu"].extend(insts)
+            # elif alu_half_offload:
+            #     # If half offload, we need to turn this slot into 8 slots + 1 vmerge noop.
+
+            #     insts = leaf.to_concrete_alu_offload(
+            #         self.using, self.consts, out_reg=out_reg
+            #     )
+            #     bundle["alu"].extend(insts)
             else:
                 engine, inst = leaf.to_concrete(
                     self.using, self.consts, out_reg=out_reg
@@ -689,7 +719,7 @@ def make_round0_graph(
     return graph
 
 
-def make_round1_graph(
+def make_round1_graph_alu(
     batch: int,
     round: int,
     val_in: str,
@@ -748,7 +778,82 @@ def make_round1_graph(
     return graph
 
 
-def make_round2_graph(
+def make_round1_graph_flow(
+    batch: int,
+    round: int,
+    val_in: str,
+    val_out: str,
+    idx_in: str,
+    idx_out: str,
+    treeval_in: str,
+    treeval_out: str,
+):
+    def vlocalize_r1(name: str) -> str:
+        return vlocalize(
+            name,
+            batch,
+            round,
+        )
+
+    hash_in = vlocalize_r1("hash_in")
+    idx_tmp = vlocalize_r1("idx_tmp")
+    parity = vlocalize_r1("parity")
+    norm_idx = vlocalize_r1("norm_idx")
+    norm_idx_down1 = vlocalize_r1("norm_idx_down1")
+    bit0 = vlocalize_r1("bit0")
+    bit1 = vlocalize_r1("bit1")
+    sel43 = vlocalize_r1("sel43")
+    sel65 = vlocalize_r1("sel65")
+
+    graph = ComputationGraph()
+    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
+    graph.merge_below(make_hash_graph(batch, round, hash_in, val_out))
+    graph.exports[val_out] = graph.inner_defs[val_out]
+    graph.add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_tmp)
+    graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
+    graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
+    graph.add_new_slot("valu-", [idx_out, vconstn(3)], dest=norm_idx)
+    graph.add_new_slot("valu&", [norm_idx, vconstn(1)], dest=bit0)
+    graph.add_new_slot("valu>>", [norm_idx, vconstn(1)], dest=norm_idx_down1)
+    graph.add_new_slot("valu&", [norm_idx_down1, vconstn(1)], dest=bit1)
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval4"), vconst("treeval3")], dest=sel43
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval6"), vconst("treeval5")], dest=sel65
+    )
+    graph.add_new_slot("vselect", [bit1, sel65, sel43], dest=treeval_out, exports=True)
+
+    assert len(graph.ext_deps) == 3 and all(
+        name in graph.ext_deps for name in (val_in, idx_in, treeval_in)
+    )
+    assert len(graph.exports) == 3 and all(
+        name in graph.exports for name in (val_out, idx_out, treeval_out)
+    )
+    return graph
+
+
+def make_round1_graph(
+    batch: int,
+    round: int,
+    val_in: str,
+    val_out: str,
+    idx_in: str,
+    idx_out: str,
+    treeval_in: str,
+    treeval_out: str,
+    use_flow=False,
+):
+    if use_flow:
+        return make_round1_graph_flow(
+            batch, round, val_in, val_out, idx_in, idx_out, treeval_in, treeval_out
+        )
+    return make_round1_graph_alu(
+        batch, round, val_in, val_out, idx_in, idx_out, treeval_in, treeval_out
+    )
+
+
+def make_round2_graph_alu(
     batch: int,
     round: int,
     val_in: str,
@@ -824,6 +929,207 @@ def make_round2_graph(
 
     graph.add_new_slot(
         "multiply_add", [bit2, dddiff147, lerp10987], dest=treeval_out, exports=True
+    )
+
+    assert len(graph.ext_deps) == 3 and all(
+        name in graph.ext_deps for name in (val_in, idx_in, treeval_in)
+    )
+    assert len(graph.exports) == 3 and all(
+        name in graph.exports for name in (val_out, idx_out, treeval_out)
+    )
+    return graph
+
+
+def make_round2_graph_flow(
+    batch: int,
+    round: int,
+    val_in: str,
+    val_out: str,
+    idx_in: str,
+    idx_out: str,
+    treeval_in: str,
+    treeval_out: str,
+):
+    def vlocalize_r2(name: str) -> str:
+        return vlocalize(
+            name,
+            batch,
+            round,
+        )
+
+    hash_in = vlocalize_r2("hash_in")
+    idx_tmp = vlocalize_r2("idx_tmp")
+    parity = vlocalize_r2("parity")
+    norm_idx = vlocalize_r2("norm_idx")
+    norm_idx_down1 = vlocalize_r2("norm_idx_down1")
+    norm_idx_down2 = vlocalize_r2("norm_idx_down2")
+    bit0 = vlocalize_r2("bit0")
+    bit1 = vlocalize_r2("bit1")
+    bit2 = vlocalize_r2("bit2")
+    sel87 = vlocalize_r2("sel87")
+    sel109 = vlocalize_r2("sel109")
+    sel1211 = vlocalize_r2("sel1211")
+    sel1413 = vlocalize_r2("sel1413")
+    sel10987 = vlocalize_r2("sel10987")
+    sel14131211 = vlocalize_r2("sel14131211")
+
+    graph = ComputationGraph()
+    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
+
+    graph.merge_below(make_hash_graph(batch, round, hash_in, val_out))
+    graph.exports[val_out] = graph.inner_defs[val_out]
+
+    graph.add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_tmp)
+    graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
+    graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
+    graph.add_new_slot("valu-", [idx_out, vconstn(7)], dest=norm_idx)
+    graph.add_new_slot("valu>>", [norm_idx, vconstn(1)], dest=norm_idx_down1)
+    graph.add_new_slot("valu>>", [norm_idx, vconstn(2)], dest=norm_idx_down2)
+    graph.add_new_slot("valu&", [norm_idx, vconstn(1)], dest=bit0)
+    graph.add_new_slot("valu&", [norm_idx_down1, vconstn(1)], dest=bit1)
+    graph.add_new_slot("valu&", [norm_idx_down2, vconstn(1)], dest=bit2)
+
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval8"), vconst("treeval7")], dest=sel87
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval10"), vconst("treeval9")], dest=sel109
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval12"), vconst("treeval11")], dest=sel1211
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval14"), vconst("treeval13")], dest=sel1413
+    )
+
+    graph.add_new_slot("vselect", [bit1, sel109, sel87], dest=sel10987)
+    graph.add_new_slot("vselect", [bit1, sel1413, sel1211], dest=sel14131211)
+    graph.add_new_slot(
+        "vselect", [bit2, sel14131211, sel10987], dest=treeval_out, exports=True
+    )
+
+    assert len(graph.ext_deps) == 3 and all(
+        name in graph.ext_deps for name in (val_in, idx_in, treeval_in)
+    )
+    assert len(graph.exports) == 3 and all(
+        name in graph.exports for name in (val_out, idx_out, treeval_out)
+    )
+    return graph
+
+
+def make_round2_graph(
+    batch: int,
+    round: int,
+    val_in: str,
+    val_out: str,
+    idx_in: str,
+    idx_out: str,
+    treeval_in: str,
+    treeval_out: str,
+    use_flow=False,
+):
+    if use_flow:
+        return make_round2_graph_flow(
+            batch, round, val_in, val_out, idx_in, idx_out, treeval_in, treeval_out
+        )
+    return make_round2_graph_alu(
+        batch, round, val_in, val_out, idx_in, idx_out, treeval_in, treeval_out
+    )
+
+
+def make_round3_graph(
+    batch: int,
+    round: int,
+    val_in: str,
+    val_out: str,
+    idx_in: str,
+    idx_out: str,
+    treeval_in: str,
+    treeval_out: str,
+):
+    def vlocalize_r3(name: str) -> str:
+        return vlocalize(
+            name,
+            batch,
+            round,
+        )
+
+    hash_in = vlocalize_r3("hash_in")
+    idx_tmp = vlocalize_r3("idx_tmp")
+    parity = vlocalize_r3("parity")
+    norm_idx = vlocalize_r3("norm_idx")
+    norm_idx_down1 = vlocalize_r3("norm_idx_down1")
+    norm_idx_down2 = vlocalize_r3("norm_idx_down2")
+    norm_idx_down3 = vlocalize_r3("norm_idx_down3")
+    bit0 = vlocalize_r3("bit0")
+    bit1 = vlocalize_r3("bit1")
+    bit2 = vlocalize_r3("bit2")
+    bit3 = vlocalize_r3("bit3")
+    sel1615 = vlocalize_r3("sel1615")
+    sel1817 = vlocalize_r3("sel1817")
+    sel2019 = vlocalize_r3("sel2019")
+    sel2221 = vlocalize_r3("sel2221")
+    sel2423 = vlocalize_r3("sel2423")
+    sel2625 = vlocalize_r3("sel2625")
+    sel2827 = vlocalize_r3("sel2827")
+    sel3029 = vlocalize_r3("sel3029")
+    sel1815 = vlocalize_r3("sel1815")
+    sel2219 = vlocalize_r3("sel2219")
+    sel2623 = vlocalize_r3("sel2623")
+    sel3027 = vlocalize_r3("sel3027")
+    sel2215 = vlocalize_r3("sel2215")
+    sel3023 = vlocalize_r3("sel3023")
+
+    graph = ComputationGraph()
+    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
+
+    graph.merge_below(make_hash_graph(batch, round, hash_in, val_out))
+    graph.exports[val_out] = graph.inner_defs[val_out]
+
+    graph.add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_tmp)
+    graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
+    graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
+    graph.add_new_slot("valu-", [idx_out, vconstn(15)], dest=norm_idx)
+    graph.add_new_slot("valu>>", [norm_idx, vconstn(1)], dest=norm_idx_down1)
+    graph.add_new_slot("valu>>", [norm_idx, vconstn(2)], dest=norm_idx_down2)
+    graph.add_new_slot("valu>>", [norm_idx, vconstn(3)], dest=norm_idx_down3)
+    graph.add_new_slot("valu&", [norm_idx, vconstn(1)], dest=bit0)
+    graph.add_new_slot("valu&", [norm_idx_down1, vconstn(1)], dest=bit1)
+    graph.add_new_slot("valu&", [norm_idx_down2, vconstn(1)], dest=bit2)
+    graph.add_new_slot("valu&", [norm_idx_down3, vconstn(1)], dest=bit3)
+
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval16"), vconst("treeval15")], dest=sel1615
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval18"), vconst("treeval17")], dest=sel1817
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval20"), vconst("treeval19")], dest=sel2019
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval22"), vconst("treeval21")], dest=sel2221
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval24"), vconst("treeval23")], dest=sel2423
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval26"), vconst("treeval25")], dest=sel2625
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval28"), vconst("treeval27")], dest=sel2827
+    )
+    graph.add_new_slot(
+        "vselect", [bit0, vconst("treeval30"), vconst("treeval29")], dest=sel3029
+    )
+    graph.add_new_slot("vselect", [bit1, sel1817, sel1615], dest=sel1815)
+    graph.add_new_slot("vselect", [bit1, sel2221, sel2019], dest=sel2219)
+    graph.add_new_slot("vselect", [bit1, sel2625, sel2423], dest=sel2623)
+    graph.add_new_slot("vselect", [bit1, sel3029, sel2827], dest=sel3027)
+    graph.add_new_slot("vselect", [bit2, sel2219, sel1815], dest=sel2215)
+    graph.add_new_slot("vselect", [bit2, sel3027, sel2623], dest=sel3023)
+    graph.add_new_slot(
+        "vselect", [bit3, sel3023, sel2215], dest=treeval_out, exports=True
     )
 
     assert len(graph.ext_deps) == 3 and all(
@@ -1106,12 +1412,28 @@ def make_batch_graph(
                     idx_out,
                     treeval_in,
                     treeval_out,
+                    use_flow=True,
                 )
             )
         # round2 graphs
         elif round % (forest_height + 1) == 2:
             graph.merge_below(
                 make_round2_graph(
+                    batch,
+                    round,
+                    val_in,
+                    val_out,
+                    idx_in,
+                    idx_out,
+                    treeval_in,
+                    treeval_out,
+                    use_flow=True,
+                )
+            )
+        # round3 graphs
+        elif round == 3:
+            graph.merge_below(
+                make_round3_graph(
                     batch,
                     round,
                     val_in,
@@ -1245,7 +1567,7 @@ class KernelBuilder:
                 const_mapping[name] = reg
             return loads
 
-        SCALARS = list(range(5)) + [7]
+        SCALARS = list(range(5)) + [7, 15]
 
         num_loads = build_scalar_constants([(str(i), i) for i in SCALARS])
         vlen_loads = build_scalar_constants([("s_vlen", VLEN)])
@@ -1294,6 +1616,25 @@ class KernelBuilder:
             [f"treeval{i}" for i in range(VLEN, 2 * VLEN)], const_mapping["7"]
         )
 
+        treeval16_addr_calc = (
+            "+",
+            const_mapping["7"],
+            const_mapping["7"],
+            const_mapping["s_vlen"],
+        )
+        treevals16_vload = vload_const_batch(
+            [f"treeval{i}" for i in range(2 * VLEN, 3 * VLEN)], const_mapping["7"]
+        )
+        treeval24_addr_calc = (
+            "+",
+            const_mapping["7"],
+            const_mapping["7"],
+            const_mapping["s_vlen"],
+        )
+        treevals24_vload = vload_const_batch(
+            [f"treeval{i}" for i in range(3 * VLEN, 4 * VLEN)], const_mapping["7"]
+        )
+
         # Input is list of (name, reg holding scalar val).
         # We allocate scratch space, broadcast the scalar, and register in const_mapping.
         # Returns the broadcasts we need to perform, as a map from name to broadcast instruction.
@@ -1306,12 +1647,12 @@ class KernelBuilder:
             return broadcasts
 
         num_vbroadcasts = build_vector_constants(
-            [(vector(str(i)), const_mapping[str(i)]) for i in (1, 2, 3, 7)]
+            [(vector(str(i)), const_mapping[str(i)]) for i in (1, 2, 3, 7, 15)]
         )
         treeval_vbroadcasts = build_vector_constants(
             [
                 (vector(f"treeval{i}"), const_mapping[f"treeval{i}"])
-                for i in range(0, VLEN * 2 - 1)
+                for i in range(0, VLEN * 4 - 1)
             ]
         )
         hash_add_vbroadcasts = build_vector_constants(
@@ -1353,17 +1694,15 @@ class KernelBuilder:
         for s, (_, vreg, i1, i2) in vdiff_valus.items():
             const_mapping[s] = vreg
 
-        scalars_to_return = (
-            ["7"]
-            + [s for s in init_vars if s not in ("forest_values_p", "inp_values_p")]
-            + [f"hash_add{i}" for i in range(len(HASH_STAGES))]
-            + [f"hash_mult{i}" for i in range(len(HASH_STAGES))]
-        )
+        scalars_to_return = ["7"] + [
+            s for s in init_vars if s not in ("forest_values_p", "inp_values_p")
+        ]
         scalar_return = {const_mapping.pop(s) for s in scalars_to_return}
 
-        vectors_to_return = ["treeval0", "treeval8"] + [
-            vector(f"treeval{i}") for i in (2, 4, 8, 12, 14)
-        ]
+        vectors_to_return = []
+        # ["treeval0", "treeval8"] + [
+        #     vector(f"treeval{i}") for i in (2, 4, 8, 12, 14)
+        # ]
         vector_return = {const_mapping.pop(v) for v in vectors_to_return}
         for i in range(1, VLEN):
             del const_mapping[f"treeval{i}"]
@@ -1379,7 +1718,7 @@ class KernelBuilder:
         # cycle 1: vload init vars, s_vlen; vbroadcast 7
         load_bundles[1].extend([init_vars_vload, vlen_loads["s_vlen"]])
         valu_bundles[1].extend([num_vbroadcasts[vector("7")]])
-        # cycle 2: vload treevals 0-7, load 1 ; alu 7 = forest_values + s_vlen
+        # cycle 2: vload treevals 0-7, load 1; alu 7 = forest_values + s_vlen
         load_bundles[2].extend([treevals0_vload, num_loads["1"]])
         alu_bundles[2].extend([treeval8_addr_calc])
         # cycle 3: vload treevals 8-15, load 2; vbroadcast treevals 0 to 5
@@ -1387,42 +1726,58 @@ class KernelBuilder:
         valu_bundles[3].extend(
             [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(6)]
         )
-        # cycle 4: load hashval0, 1; vbroadcast treevals 6 to 11;
-        load_bundles[4].extend([hash_add_loads[f"hash_add{i}"] for i in range(2)])
+        alu_bundles[3].extend([treeval16_addr_calc])
+        # cycle 4: vload treevals 16-23, load hashval0; vbroadcast treevals 6 to 11
+        load_bundles[4].extend([treevals16_vload] + [hash_add_loads["hash_add0"]])
         valu_bundles[4].extend(
             [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(6, 12)]
         )
-        # cycle 5: load hashval2, 3; vbroadcast treevals 12 to 14, valu diff21, 43, 65
-        load_bundles[5].extend([hash_add_loads[f"hash_add{i}"] for i in range(2, 4)])
+        alu_bundles[4].extend([treeval24_addr_calc])
+        # cycle 5: vload treevals 24-31, load hashval1; vbroadcast treevals 12 to 17
+        load_bundles[5].extend([treevals24_vload] + [hash_add_loads["hash_add1"]])
         valu_bundles[5].extend(
-            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(12, 15)]
+            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(12, 18)]
+        )
+        # cycle 6: load hashval 2, 3; vbroadcast treevals 18 to 23
+        load_bundles[6].extend([hash_add_loads[f"hash_add{i}"] for i in range(2, 4)])
+        valu_bundles[6].extend(
+            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(18, 24)]
+        )
+        # cycle 7: load hashval 4, 5; vbroadcast treevals 24 to 29
+        load_bundles[7].extend([hash_add_loads[f"hash_add{i}"] for i in range(4, 6)])
+        valu_bundles[7].extend(
+            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(24, 30)]
+        )
+        # cycle 8: load hashval 0, 1; vbroadcast treeval30, 1, 2 and valu diff21, 43, 65
+        load_bundles[8].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2)])
+        valu_bundles[8].extend(
+            [treeval_vbroadcasts[vector("treeval30")]]
+            + [num_vbroadcasts[vector(f"{i}")] for i in range(1, 3)]
             + [vdiff_valus[vector(f"diff{i + 1}{i}")] for i in range(1, 6, 2)]  # 1 3 5
         )
-        # cycle 6: load hashval4, 5; valu diff87, 109, 1211, 1413, vbroadcast 1, 2
-        load_bundles[6].extend([hash_add_loads[f"hash_add{i}"] for i in range(4, 6)])
-        valu_bundles[6].extend(
+        # cycle 9: load hashval 2, 3; valu diff87, 109, 1211, 1413, vbroadcast forest_values_p
+        load_bundles[9].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2, 4)])
+        valu_bundles[9].extend(
             [
                 vdiff_valus[vector(f"diff{i + 1}{i}")] for i in range(7, 14, 2)
             ]  # 7 9 11 13
-            + [num_vbroadcasts[vector(f"{i}")] for i in range(1, 3)]
+            + [forest_vals_vbroadcasts[vector("forest_values_p")]]
         )
-        # cycle 7: load hash_mult 0, 1; vbroadcast hash_add 0-5
-        load_bundles[7].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2)])
-        valu_bundles[7].extend(
+        # cycle 10: load hashval 4, 5; vbroadcast hash_add 0-5
+        load_bundles[10].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(4, 6)])
+        valu_bundles[10].extend(
             [hash_add_vbroadcasts[vector(f"hash_add{i}")] for i in range(6)]
         )
-        # cycle 8: load hash_mult 2, 3; vbroadcast forest_values_p
-        load_bundles[8].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2, 4)])
-        valu_bundles[8].extend([forest_vals_vbroadcasts[vector("forest_values_p")]])
-        # cycle 9: load hash_mult 4, 5
-        load_bundles[9].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(4, 6)])
-        # cycle 10: load 3, 4; vbroadcast hash_mult 0-5
-        load_bundles[10].extend([num_loads["3"], num_loads["4"]])
-        valu_bundles[10].extend(
+        # cycle 11: load 3, 4; vbroadcast hash_mult 0-5
+        load_bundles[11].extend([num_loads["3"], num_loads["4"]])
+        valu_bundles[11].extend(
             [hash_mult_vbroadcasts[vector(f"hash_mult{i}")] for i in range(6)]
         )
-        # cycle 11: vbroadcast 3
-        valu_bundles[11].extend([num_vbroadcasts[vector("3")]])
+        # cycle 12: load 15, vbroadcast 3
+        load_bundles[12].extend([num_loads["15"]])
+        valu_bundles[12].extend([num_vbroadcasts[vector("3")]])
+        # cycle 13: vbroadcast 15
+        valu_bundles[13].extend([num_vbroadcasts[vector("15")]])
 
         setup_cycle_count = 0
         for load_bundle, valu_bundle, alu_bundle in zip(

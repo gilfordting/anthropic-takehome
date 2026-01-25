@@ -656,9 +656,7 @@ def make_mid_round_graph(
     graph.add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_tmp)
     graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
     graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
-    graph.add_new_slot(
-        "val_addrs", [vconst("forest_values_p"), idx_out], dest=val_addrs
-    )
+    graph.add_new_slot("valu+", [vconst("forest_values_p"), idx_out], dest=val_addrs)
 
     for i, partial in enumerate(partials):
         graph.add_new_slot("vload_scalar", [val_addrs, i], dest=partial)

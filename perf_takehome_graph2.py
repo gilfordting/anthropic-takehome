@@ -399,11 +399,17 @@ class ComputationGraph:
         self.exports: dict[str, SymbolicInstructionSlot] = {}
 
     def add_edge(
-        self, from_node: SymbolicInstructionSlot, to_node: SymbolicInstructionSlot
+        self,
+        from_node: SymbolicInstructionSlot,
+        to_node: SymbolicInstructionSlot,
+        var: str,  # can be either the dest or FAKE
     ):
         assert from_node in self.graph, f"originating node {from_node} must be in graph"
         assert to_node in self.graph, f"destination node {to_node} must be in graph"
-        self.graph.add_edge(from_node, to_node)
+        assert var == "FAKE" or var == from_node.dest, (
+            f"var {var} is not the dest or FAKE"
+        )
+        self.graph.add_edge(from_node, to_node, data=var)
 
     # Must add slots in dependency order.
     # The last slot added to the graph must be marked. This defines the export.
@@ -416,7 +422,8 @@ class ComputationGraph:
             if arg in self.inner_defs:
                 # Draw edge from inner def's node to this one
                 # We don't need to mark with var name, because it's always the same as the originating node's `dest`
-                self.add_edge(self.inner_defs[arg], slot)
+                # TODO not true anymore! fake deps possible
+                self.add_edge(self.inner_defs[arg], slot, var=arg)
                 continue
             # Otherwise, we need this variable from outside our graph. Add to external dependencies; we will draw the edge later.
             self.ext_deps[arg].append(slot)
@@ -448,7 +455,7 @@ class ComputationGraph:
             # If this graph has slots depending on something we produce, then we add edges connecting them.
             if var_name in self.inner_defs:
                 for slot in slots:
-                    self.graph.add_edge(self.inner_defs[var_name], slot)
+                    self.graph.add_edge(self.inner_defs[var_name], slot, var=var_name)
                 continue
             # Otherwise, we add it as another external dependency.
             self.ext_deps[var_name].extend(slots)
@@ -464,20 +471,19 @@ class ComputationGraph:
 class FullComputationGraph:
     def __init__(
         self,
-        graphs: list[ComputationGraph],
+        graph: nx.DiGraph,
         scalar_freelist: set[int],
         vector_freelist: set[int],
         consts: dict[str, int],
     ):
-        self.graph = nx.DiGraph()
-        for g in graphs:
-            self.graph = nx.union(self.graph, g.graph)
+        self.graph = graph
         self.using = {}
         self.scalar_freelist = scalar_freelist
         self.vector_freelist = vector_freelist
         self.consts = consts
         self.refcounts = defaultdict(int)
         self.distance_to_notable = {}
+        self.longest_dep_chain = {}
         self.__post_init__()
 
     def __post_init__(self):
@@ -486,7 +492,22 @@ class FullComputationGraph:
             for node in self.graph.nodes
         )
         self.prune_noops()
+        self.populate_heuristics()
+
+    def populate_heuristics(self):
+        self.distance_to_notable = {}
+        self.longest_dep_chain = {}
         for node in reversed(list(nx.topological_sort(self.graph))):
+            self.longest_dep_chain[node] = (
+                max(
+                    (
+                        self.longest_dep_chain[succ]
+                        for succ in self.graph.successors(node)
+                    ),
+                    default=0,
+                )
+                + 1
+            )
             if node.is_notable:
                 self.distance_to_notable[node] = 0
             else:
@@ -533,6 +554,8 @@ class FullComputationGraph:
             self.using[name] = reg
             return reg
         if is_vector(name):
+            if len(self.vector_freelist) == 0:
+                print("using:", self.using)
             reg = self.vector_freelist.pop()
             self.using[name] = reg
             return reg
@@ -628,19 +651,24 @@ class FullComputationGraph:
                 # first, add vmerge to the graph. give it the same forward deps as the original leaf, and the same heuristic scores
                 self.graph.add_node(vmerge_noop)
                 for succ in self.graph.successors(leaf):
-                    self.graph.add_edge(vmerge_noop, succ)
+                    self.graph.add_edge(vmerge_noop, succ, var=leaf.dest)
                 self.distance_to_notable[vmerge_noop] = self.distance_to_notable[leaf]
+                self.longest_dep_chain[vmerge_noop] = self.longest_dep_chain[leaf]
                 # we can safely remove original node now
                 self.graph.remove_node(leaf)
                 # then, add partials to the graph
                 for partial_leaf in partial_leaves:
                     self.graph.add_node(partial_leaf)
-                    self.graph.add_edge(partial_leaf, vmerge_noop)
+                    self.graph.add_edge(
+                        partial_leaf, vmerge_noop, var=partial_leaf.dest
+                    )
                     # the only forward dep is vmerge noop, so update scores accordingly
                     self.distance_to_notable[partial_leaf] = (
                         self.distance_to_notable[vmerge_noop] + 1
                     )
-
+                    self.longest_dep_chain[partial_leaf] = (
+                        self.longest_dep_chain[vmerge_noop] + 1
+                    )
                 # Also dependency tracking.
                 for arg in leaf.dependencies:
                     # the dependency has gone from 1 to 8
@@ -677,7 +705,12 @@ class FullComputationGraph:
                 bundle[engine].append(inst)
 
             # Reftracking: what slots depend on this one?
-            n_forward_deps = self.graph.out_degree(leaf)
+            n_forward_deps = 0
+            for _, _, var_name in self.graph.out_edges(leaf, data=True):
+                if var_name == "FAKE":
+                    continue
+                n_forward_deps += 1
+
             if leaf.dest is not None and n_forward_deps > 0:
                 assert leaf.dest not in self.refcounts, (
                     f"leaf.dest {leaf.dest} already in refcounts, from leaf {leaf}"
@@ -687,7 +720,7 @@ class FullComputationGraph:
             # Remove this leaf, expose more work/leaves
             self.graph.remove_node(leaf)
 
-            # We can also free registers from our arguments, if refcount reaches 0
+            # # We can also free registers from our arguments, if refcount reaches 0
             for arg in leaf.dependencies:
                 self.refcounts[arg] -= 1
                 if self.refcounts[arg] == 0:
@@ -1054,24 +1087,54 @@ def make_round2_graph_flow(
     graph.add_new_slot("valu&", [norm_idx_down1, vconstn(1)], dest=bit1)
     graph.add_new_slot("valu&", [norm_idx_down2, vconstn(1)], dest=bit2)
 
-    graph.add_new_slot(
+    sel87_slot = make_slot(
         "vselect", [bit0, vconst("treeval8"), vconst("treeval7")], dest=sel87
     )
-    graph.add_new_slot(
+    sel109_slot = make_slot(
         "vselect", [bit0, vconst("treeval10"), vconst("treeval9")], dest=sel109
     )
-    graph.add_new_slot(
+    sel1211_slot = make_slot(
         "vselect", [bit0, vconst("treeval12"), vconst("treeval11")], dest=sel1211
     )
-    graph.add_new_slot(
+    sel1413_slot = make_slot(
         "vselect", [bit0, vconst("treeval14"), vconst("treeval13")], dest=sel1413
     )
-
-    graph.add_new_slot("vselect", [bit1, sel109, sel87], dest=sel10987)
-    graph.add_new_slot("vselect", [bit1, sel1413, sel1211], dest=sel14131211)
-    graph.add_new_slot(
-        "vselect", [bit2, sel14131211, sel10987], dest=treeval_out, exports=True
+    sel10987_slot = make_slot("vselect", [bit1, sel109, sel87], dest=sel10987)
+    sel14131211_slot = make_slot("vselect", [bit1, sel1413, sel1211], dest=sel14131211)
+    treeval_out_slot = make_slot(
+        "vselect", [bit2, sel14131211, sel10987], dest=treeval_out
     )
+
+    graph.add_slot(sel87_slot)
+    graph.add_slot(sel109_slot)
+    graph.add_slot(sel1211_slot)
+    graph.add_slot(sel1413_slot)
+    graph.add_slot(sel10987_slot)
+    graph.add_slot(sel14131211_slot)
+    graph.add_slot(treeval_out_slot, exports=True)
+
+    # for src in [sel87_slot, sel109_slot, sel1211_slot, sel1413_slot]:
+    #     for target in [sel10987_slot, sel14131211_slot]:
+    #         graph.add_edge(src, target, var="FAKE")
+
+    # graph.add_new_slot(
+    #     "vselect", [bit0, vconst("treeval8"), vconst("treeval7")], dest=sel87
+    # )
+    # graph.add_new_slot(
+    #     "vselect", [bit0, vconst("treeval10"), vconst("treeval9")], dest=sel109
+    # )
+    # graph.add_new_slot(
+    #     "vselect", [bit0, vconst("treeval12"), vconst("treeval11")], dest=sel1211
+    # )
+    # graph.add_new_slot(
+    #     "vselect", [bit0, vconst("treeval14"), vconst("treeval13")], dest=sel1413
+    # )
+
+    # graph.add_new_slot("vselect", [bit1, sel109, sel87], dest=sel10987)
+    # graph.add_new_slot("vselect", [bit1, sel1413, sel1211], dest=sel14131211)
+    # graph.add_new_slot(
+    #     "vselect", [bit2, sel14131211, sel10987], dest=treeval_out, exports=True
+    # )
 
     assert len(graph.ext_deps) == 3 and all(
         name in graph.ext_deps for name in (val_in, idx_in, treeval_in)
@@ -1444,10 +1507,15 @@ def make_batch_graph(
 ) -> ComputationGraph:
     curr_addr = batch_localize("curr_addr", batch)
     # val, idx, treeval get diff names based on round
-    graph = ComputationGraph()
+    cgraph = ComputationGraph()
     curr_addr = batch_localize("curr_addr", batch)
     val_init = vbatch_localize("val_init", batch)
-    graph.merge_below(make_init_load_graph(batch, curr_addr, val_init))
+    cgraph.merge_below(make_init_load_graph(batch, curr_addr, val_init))
+
+    # Only 4 batches can be in round 2 at any given moment? slot for treeval_in, slot for treeval_out for all of the round 2s
+    batch1_inout_slots = {}
+    batch2_inout_slots = {}
+    batch3_inout_slots = {}
 
     for round in range(rounds):
         # define output variables for this round; will be used as input for next round
@@ -1462,12 +1530,12 @@ def make_batch_graph(
         # round0 graphs
         if round % (forest_height + 1) == 0:
             val_in = val_init if round == 0 else val_in
-            graph.merge_below(
+            cgraph.merge_below(
                 make_round0_graph(batch, round, val_in, val_out, idx_out, treeval_out)
             )
         # round1 graphs
         elif round % (forest_height + 1) == 1:
-            graph.merge_below(
+            cgraph.merge_below(
                 make_round1_graph(
                     batch,
                     round,
@@ -1480,9 +1548,17 @@ def make_batch_graph(
                     use_flow=True,
                 )
             )
+            batch1_inout_slots[round] = (
+                treeval_in,
+                treeval_out,
+                val_in,
+                val_out,
+                idx_in,
+                idx_out,
+            )
         # round2 graphs
         elif round % (forest_height + 1) == 2:
-            graph.merge_below(
+            cgraph.merge_below(
                 make_round2_graph(
                     batch,
                     round,
@@ -1495,9 +1571,17 @@ def make_batch_graph(
                     use_flow=True,
                 )
             )
+            batch2_inout_slots[round] = (
+                treeval_in,
+                treeval_out,
+                val_in,
+                val_out,
+                idx_in,
+                idx_out,
+            )
         # round3 graphs
         elif round == 3:
-            graph.merge_below(
+            cgraph.merge_below(
                 make_round3_graph(
                     batch,
                     round,
@@ -1509,18 +1593,26 @@ def make_batch_graph(
                     treeval_out,
                 )
             )
+            batch3_inout_slots[round] = (
+                treeval_in,
+                treeval_out,
+                val_in,
+                val_out,
+                idx_in,
+                idx_out,
+            )
         # last round
         elif round == rounds - 1:
-            graph.merge_below(
+            cgraph.merge_below(
                 make_last_round_graph(batch, round, val_in, treeval_in, curr_addr)
             )
         # wraparound graph
         elif (round + 1) % (forest_height + 1) == 0:
-            graph.merge_below(
+            cgraph.merge_below(
                 make_wraparound_graph(batch, round, val_in, treeval_in, val_out)
             )
         else:
-            graph.merge_below(
+            cgraph.merge_below(
                 make_mid_round_graph(
                     batch,
                     round,
@@ -1532,6 +1624,132 @@ def make_batch_graph(
                     treeval_out,
                 )
             )
+
+    assert len(cgraph.ext_deps) == 0
+    assert len(cgraph.exports) == 0
+    # find the corresponding slots
+    slots = {}
+    for node in cgraph.graph.nodes:
+        for round in (2, forest_height + 1 + 2):
+            treeval_in, treeval_out, val_in, val_out, idx_in, idx_out = (
+                batch2_inout_slots[round]
+            )
+            if node.dest == treeval_in:
+                slots[(round, "tin")] = node
+            elif node.dest == treeval_out:
+                slots[(round, "tout")] = node
+            elif node.dest == val_in:
+                slots[(round, "vin")] = node
+            elif node.dest == val_out:
+                slots[(round, "vout")] = node
+            elif node.dest == idx_in:
+                slots[(round, "iin")] = node
+            elif node.dest == idx_out:
+                slots[(round, "iout")] = node
+        for round in (1, forest_height + 1 + 1):
+            treeval_in, treeval_out, val_in, val_out, idx_in, idx_out = (
+                batch1_inout_slots[round]
+            )
+            if node.dest == treeval_in:
+                slots[(round, "tin")] = node
+            elif node.dest == treeval_out:
+                slots[(round, "tout")] = node
+            elif node.dest == val_in:
+                slots[(round, "vin")] = node
+            elif node.dest == val_out:
+                slots[(round, "vout")] = node
+            elif node.dest == idx_in:
+                slots[(round, "iin")] = node
+            elif node.dest == idx_out:
+                slots[(round, "iout")] = node
+        round = 3
+        treeval_in, treeval_out, val_in, val_out, idx_in, idx_out = batch3_inout_slots[
+            round
+        ]
+        if node.dest == treeval_in:
+            slots[(round, "tin")] = node
+        elif node.dest == treeval_out:
+            slots[(round, "tout")] = node
+        elif node.dest == val_in:
+            slots[(round, "vin")] = node
+        elif node.dest == val_out:
+            slots[(round, "vout")] = node
+        elif node.dest == idx_in:
+            slots[(round, "iin")] = node
+        elif node.dest == idx_out:
+            slots[(round, "iout")] = node
+
+    return cgraph, slots
+
+
+def make_all_batches_graph(
+    forest_height: int,
+    batch_size: int,
+    rounds: int,
+) -> nx.DiGraph:
+    comp_graphs = []
+    for batch in range(0, batch_size, VLEN):
+        comp_graphs.append(make_batch_graph(forest_height, rounds, batch))
+    nx_graphs = [g.graph for g, _ in comp_graphs]
+    graph = nx.union_all(nx_graphs)
+    batch_slots = [slots for _, slots in comp_graphs]
+    all_batch_slots = {}
+    for i, slots in enumerate(batch_slots):
+        batch = i * VLEN
+        for round, slot_type in slots:
+            all_batch_slots[(batch, round, slot_type)] = slots[(round, slot_type)]
+
+    # Now we need to add cross-batch edges between the graphs. This will allow us to limit the number of concurrent batches in each round.
+    def add_fake_dep(
+        from_node: SymbolicInstructionSlot,
+        to_node: SymbolicInstructionSlot,
+    ):
+        assert from_node in graph, f"originating node {from_node} must be in graph"
+        assert to_node in graph, f"destination node {to_node} must be in graph"
+        graph.add_edge(from_node, to_node, data="FAKE")
+
+    # serialize batch0 123, batch8 123, batch16 123, etc
+    for i in range(batch_size, VLEN):
+        if i - VLEN < 0:
+            continue
+        # dep. between previous vout and current vin
+        add_fake_dep(
+            all_batch_slots[(i, 3, "vout")], all_batch_slots[(i - VLEN, 1, "vin")]
+        )
+
+    # N_CONCURRENT_BATCHES = 4
+    # batches 0*VLEN, 1*VLEN, ..., (N_CONCURRENT_BATCHES-1)*VLEN can run at the same time
+    # then batch 4*VLEN depends on batch 0*VLEN, etc
+    # for i in range(batch_size // VLEN):
+    #     if i - N_CONCURRENT_BATCHES < 0:
+    #         continue
+    #     add_fake_dep(
+    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 2, "tout")],
+    #         all_batch_slots[(i * VLEN, 2, "tin")],
+    #     )
+    #     add_fake_dep(
+    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 2, "vout")],
+    #         all_batch_slots[(i * VLEN, 2, "vin")],
+    #     )
+    #     add_fake_dep(
+    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 2, "iout")],
+    #         all_batch_slots[(i * VLEN, 2, "iin")],
+    #     )
+    # for i in range(batch_size // VLEN):
+    #     if i - N_CONCURRENT_BATCHES < 0:
+    #         continue
+    #     add_fake_dep(
+    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 1, "tout")],
+    #         all_batch_slots[(i * VLEN, 1, "tin")],
+    #     )
+    #     add_fake_dep(
+    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 1, "vout")],
+    #         all_batch_slots[(i * VLEN, 1, "vin")],
+    #     )
+    #     add_fake_dep(
+    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 1, "iout")],
+    #         all_batch_slots[(i * VLEN, 1, "iin")],
+    #     )
 
     return graph
 
@@ -1546,10 +1764,7 @@ def make_kernel_graph(
     consts: dict[str, int],
 ) -> FullComputationGraph:
     return FullComputationGraph(
-        [
-            make_batch_graph(forest_height, rounds, batch)
-            for batch in range(0, batch_size, VLEN)
-        ],
+        make_all_batches_graph(forest_height, batch_size, rounds),
         scalar_freelist,
         vector_freelist,
         consts,
@@ -1857,7 +2072,7 @@ class KernelBuilder:
     def make_freelists(self, scalar_return, vector_return):
         scratch_left = SCRATCH_SIZE - self.scratch_ptr
         # TODO tune this? each batch is now not limited to 3 scalar registers
-        N_SCALAR_REG = 32 * 3
+        N_SCALAR_REG = 32 * 2
         num_extra_scalar = N_SCALAR_REG - len(scalar_return)
         # take the rest for vector regs
         num_vector_alloc = (scratch_left - num_extra_scalar) // VLEN
@@ -1881,6 +2096,9 @@ class KernelBuilder:
         # make register freelists. this is free (no cycles)
         scalar_freelist, vector_freelist = self.make_freelists(
             scalar_return, vector_return
+        )
+        print(
+            f"{len(scalar_freelist)} scalar registers, {len(vector_freelist)} vector registers"
         )
         assert all(reg < 1536 for reg in scalar_freelist), (
             "scalar register is out of bounds"

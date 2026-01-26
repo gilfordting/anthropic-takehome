@@ -229,16 +229,9 @@ parity = val_out % 2
 idx_out = idx_tmp + parity
 val_addrs = vconst forest_values_p + idx_out
 
-vload_scalar partial_treeval_0 val_addrs, 0
-vload_scalar partial_treeval_1 val_addrs, 1
-vload_scalar partial_treeval_2 val_addrs, 2
-vload_scalar partial_treeval_3 val_addrs, 3
-vload_scalar partial_treeval_4 val_addrs, 4
-vload_scalar partial_treeval_5 val_addrs, 5
-vload_scalar partial_treeval_6 val_addrs, 6
-vload_scalar partial_treeval_7 val_addrs, 7
+load treeval_out @ i <- val_addrs @ i
 
-vmerge treeval_out, partial_treeval_0, partial_treeval_1, partial_treeval_2, partial_treeval_3, partial_treeval_4, partial_treeval_5, partial_treeval_6, partial_treeval_7
+vmerge treeval_out, treeval_out @ 0, treeval_out @ 1,...
 ```
 
 ## initial load
@@ -321,6 +314,11 @@ build constants first
 
 ```asm
 (valu) dest = a1 op a2
+valu_scalar_half partial_dest_0 op a1, a2, 0
+valu_scalar_half partial_dest_4 op a1, a2, 4
+vmerge dest, partial_dest_0, partial_dest_4
+
+
 becomes
 valu_scalar partial_dest_0 op a1, a2, 0
 valu_scalar partial_dest_1 op, a1, a2, 1
@@ -329,26 +327,63 @@ valu_scalar op partial_dest_7 a1, a2, 7
 vmerge dest, partial_dest_0, partial_dest_1, partial_dest_2, partial_dest_3, partial_dest_4, partial_dest_5, partial_dest_6, partial_dest_7
 ```
 
+one gets scheduled this round, one gets scheduled the next round
+
 check that vmerge works fine as well
 
 ## beginning
 
 ```asm
-const load: 0, 1, 2, 3, 4, 5, 7, 15
-const load s_vlen, 8
-vload "0"
-vsplit 
+# Const loads
+for i in (0, 1, 2, 3, 4, 7)
+const load "const i" <- i
+const load "const s_vlen" <- 8
 
-# TODO: how to handle unallocated vars here?
+const load "const hash_add0" <VALUE>
+...
+const load "const hash_add5" <VALUE>
 
+const load "const hash_mult0" <VALUE>
+...
+const load "const hash_mult5" <VALUE>
 
-hash_add_012345
-hash_mult_012345
-vload 0
-vload treeval0 <- forest_values_p
+# Initial vload
+vload "const v_init_vars" <- "const 0"
 
-+ "7" "forest_values_p" "s_vlen"
-vload 
+# Address calculations
+"treevals_addr8" = "const v_init_vars" @ 3 + "s_vlen"
+"treevals_addr16" = "treevals_addr8" + "s_vlen"
+"treevals_addr24" = "treevals_addr16" + "s_vlen"
+
+# vloads
+vload "const v_treevals_starting0" <- "const v_init_vars" @ 3 (forest_values_p)
+vload "const v_treevals_starting8" <- "treevals_addr8"
+vload "const v_treevals_starting16" <- "treevals_addr16"
+vload "const v_treevals_starting24" <- "treevals_addr24"
+
+# vbroadcasts
+vbroadcast "const v_treeval0" <- const v_treevals_starting0" @ 0
+...
+vbroadcast "const v_treeval7" <- "const v_treevals_starting0" @ 7
+
+vbroadcast "const v_treeval8" <- "const v_treevals_starting8" @ 0
+...
+vbroadcast "const v_treeval15" <- "const v_treevals_starting8" @ 7
+
+vbroadcast "const v_treeval16" <- "const v_treevals_starting16" @ 0
+...
+vbroadcast "const v_treeval23" <- "const v_treevals_starting16" @ 7
+
+vbroadcast "const v_treeval24" <- "const v_treevals_starting24" @ 0
+...
+vbroadcast "const v_treeval31" <- "const v_treevals_starting24" @ 7
+
+vbroadcast "const v_hash_add0" <- "const hash_add0"
+...
+same for mult
+
+vbroadcast "v_forest_values_p" <- "v_init_vars" @ 3 (forest_values_p)
+
+for i in (1, 2, 3, 7, 15)
+vbroadcast "v_i", "i"
 ```
-
-AssertionError: ext deps defaultdict(<class 'list'>, {'const inp_values_p': [SymbolicInstructionSlot(batch=0, engine='alu', op='+', arg_names=('const inp_values_p', 'const 0'), dest='curr_addr_batch0'), SymbolicInstructionSlot(batch=0, engine='load', op='vload', arg_names=('const inp_values_p',), dest='v_val_init_batch0')], 'const 0': [SymbolicInstructionSlot(batch=0, engine='alu', op='+', arg_names=('const inp_values_p', 'const 0'), dest='curr_addr_batch0')]}) do not match

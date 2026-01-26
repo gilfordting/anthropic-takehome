@@ -19,10 +19,9 @@ We recommend you look through problem.py next.
 from collections import defaultdict
 from dataclasses import dataclass
 import random
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 import unittest
 import networkx as nx
-from ortools.sat.python import cp_model
 
 from problem import (
     Instruction,
@@ -41,432 +40,6 @@ from problem import (
 )
 
 Engine = Literal["alu", "valu", "load", "store", "flow", "debug", "NO-OP"]
-
-# Variable naming stuff.
-# Const has precedence over vector. Vector constants are like const vX.
-CONST_PREFIX = "const "
-VECTOR_PREFIX = "v_"
-
-
-def const(name: str) -> str:
-    return f"{CONST_PREFIX}{name}"
-
-
-def constn(n: int) -> str:
-    return f"{CONST_PREFIX}{n}"
-
-
-def is_const(name: str) -> bool:
-    if not isinstance(name, str):
-        return False
-    return name.startswith(CONST_PREFIX)
-
-
-def deconst(name: str) -> str:
-    assert is_const(name)
-    return name[len(CONST_PREFIX) :]
-
-
-def vector(name: str) -> str:
-    return f"{VECTOR_PREFIX}{name}"
-
-
-def is_vector(name: str) -> bool:
-    if is_const(name):
-        return is_vector(deconst(name))
-    return name.startswith(VECTOR_PREFIX)
-
-
-# for partial vector vars, where 1 lane of a vector register is used
-# partial variables cannot be constants or vectors. they are used in two places:
-# - output of vload_scalar custom instruction
-# - input to vmerge custom instruction
-# partial vars must have a corresponding vector var `v` if they're used as args; will be created only once if used as the dest.
-# will be in the format partial_<v's name>_<lane number>
-# also used for alu half-offloading
-PARTIAL_PREFIX = "partial_"
-
-
-def make_partial(vname: str, lane_number: int) -> str:
-    return f"{PARTIAL_PREFIX}{vname}_{lane_number}"
-
-
-def get_partial_vname(name: str) -> str:
-    assert is_partial(name)
-    # get rid of prefix and lane number
-    return "_".join(name.split("_")[1:-1])
-
-
-def is_partial(name: str) -> bool:
-    return name.startswith(PARTIAL_PREFIX)
-
-
-def is_alu_op(name: str) -> bool:
-    return name in (
-        "+",
-        "-",
-        "*",
-        "//",
-        "cdiv",
-        "^",
-        "&",
-        "|",
-        "<<",
-        ">>",
-        "%",
-        "<",
-        "==",
-    )
-
-
-def is_scalar(name: str) -> bool:
-    if is_const(name):
-        return is_scalar(deconst(name))
-    return not is_vector(name) and not is_partial(name) and not is_alu_op(name)
-
-
-def vconst(name: str) -> str:
-    return const(vector(name))
-
-
-def vconstn(n: int) -> str:
-    return vconst(str(n))
-
-
-# localize a name to a batch and round
-def localize(name: str, batch: int, round: int) -> str:
-    return f"{name}_batch{batch}_round{round}"
-
-
-def vlocalize(name: str, batch: int, round: int) -> str:
-    return vector(localize(name, batch, round))
-
-
-def batch_localize(name: str, batch: int) -> str:
-    return f"{name}_batch{batch}"
-
-
-def vbatch_localize(name: str, batch: int) -> str:
-    return vector(batch_localize(name, batch))
-
-
-# Define a new op, "vload_scalar": we will create our own custom backend for it.
-# Same for vmerge.
-def infer_engine(op: str) -> (Engine, str):
-    engine = None
-    if op == "vmerge":
-        engine = "NO-OP"
-    elif op == "vload_scalar":
-        engine = "load"
-    elif op == "valu_scalar":
-        engine = "alu"
-    elif "load" in op or "const" in op:
-        engine = "load"
-    elif "store" in op:
-        engine = "store"
-    elif op in ("+", "-", "*", "//", "cdiv", "^", "&", "|", "<<", ">>", "%", "<", "=="):
-        engine = "alu"
-    elif op == "multiply_add":
-        engine = "valu"
-    elif "valu" in op:
-        engine = "valu"
-        op = op[4:]
-    elif op in (
-        "select",
-        "add_imm",
-        "vselect",
-        "halt",
-        "pause",
-        "trace_write",
-        "cond_jump",
-        "cond_jump_rel",
-        "jump",
-        "jump_indirect",
-        "coreid",
-    ):
-        engine = "flow"
-    else:
-        engine = "debug"
-
-    assert engine is not None, f"invalid engine: {op}"
-
-    return engine, op
-
-
-# Must be hashable to be added to DiGraph
-@dataclass(frozen=True)
-class SymbolicInstructionSlot:
-    engine: Engine
-    op: str
-    # dependencies are all here; args can also be constants
-    arg_names: tuple[str, ...]
-    # produced variable name
-    dest: Optional[str] = None
-    # batch: int
-    # round: int
-    # comment: str = None
-
-    # Check that all variable names follow conventions/are valid for the given engine + op combo.
-    # Also that the proper number of arguments are passed, and that the destination is properly defined.
-    def __post_init__(self):
-        match self.engine:
-            case "alu":
-                assert self.dest is not None
-                if self.op == "valu_scalar":
-                    assert is_partial(self.dest), f"dest {self.dest} is not a partial"
-                    assert len(self.arg_names) == 4
-                    assert isinstance(self.arg_names[0], str)
-                    assert all(is_vector(arg) for arg in self.arg_names[1:3])
-                    assert isinstance(self.arg_names[3], int)
-                    return
-                assert all(is_scalar(arg) for arg in self.arg_names)
-                assert len(self.arg_names) == 2
-                assert is_scalar(self.dest)
-            case "valu":
-                assert self.dest is not None
-                assert is_vector(self.dest), f"dest {self.dest} is not a vector"
-                if self.op == "vbroadcast":
-                    assert len(self.arg_names) == 1
-                    assert is_scalar(self.arg_names[0])
-                    return
-                assert all(is_vector(arg) for arg in self.arg_names)
-                n_args = 3 if self.op == "multiply_add" else 2
-                assert len(self.arg_names) == n_args
-            case "load":
-                assert self.dest is not None
-                if self.op == "vload_scalar":
-                    assert is_partial(self.dest)
-                    assert len(self.arg_names) == 2
-                    assert is_vector(self.arg_names[0])
-                    assert isinstance(self.arg_names[1], int)
-                elif self.op == "vload":
-                    assert is_vector(self.dest), f"dest {self.dest} is not a vector"
-                elif self.op == "load":
-                    assert len(self.arg_names) == 1
-                    assert is_scalar(self.arg_names[0])
-                    assert is_scalar(self.dest)
-                elif self.op == "load_offset":
-                    assert len(self.arg_names) == 2
-                    assert is_scalar(self.arg_names[0])
-                    assert isinstance(self.arg_names[1], int)
-                    assert is_scalar(self.dest)
-                else:
-                    assert self.op == "const", f"op {self.op} is not const"
-                    assert is_scalar(self.dest)
-                    assert isinstance(self.arg_names[1], int)
-            case "store":
-                assert self.dest is None
-                assert len(self.arg_names) == 2
-                assert is_scalar(self.arg_names[0])
-                if self.op == "vstore":
-                    assert is_vector(self.arg_names[1])
-                else:
-                    assert is_scalar(self.arg_names[1])
-            case "flow":
-                assert self.op in ("pause", "vselect")
-            case "NO-OP":
-                assert len(self.arg_names) == 8
-                assert all(is_partial(arg) for arg in self.arg_names)
-                names = [get_partial_vname(arg) for arg in self.arg_names]
-                names_set = set(names)
-                assert len(names_set) == 1  # should all have the same vname
-                assert names_set.pop() == self.dest
-            case "debug":
-                # anything works
-                return
-
-    @property
-    def dependencies(self) -> set[str]:
-        def is_var_arg(arg: str) -> bool:
-            if isinstance(arg, int):
-                return False
-            if is_const(arg):
-                return False
-            if is_vector(arg):
-                return True
-            if is_partial(arg):
-                return True
-            return is_scalar(arg)
-
-        return {arg for arg in self.arg_names if is_var_arg(arg)}
-
-    @property
-    def has_def(self) -> bool:
-        return self.dest is not None
-
-    @property
-    def is_notable(self) -> bool:
-        return self.engine == "load" or self.engine == "store"
-
-    def to_concrete(
-        self,
-        using: dict[str, int],
-        consts: dict[str, int],
-        out_reg: Optional[int] = None,
-    ) -> (Engine, tuple):
-        if self.dest is None:
-            assert out_reg is None
-        else:
-            assert out_reg is not None
-        # Resolution/translation happens here.
-        assert self.engine != "NO-OP"
-        offset = 0
-        arg_names = self.arg_names
-        op = self.op
-        if self.op == "vload_scalar":
-            # Instructions look like this:
-            # vload_scalar partial_treeval_0 val_addrs, 0
-            # Turn into load dest, addr (add the offset to both registers)
-            addr, offset = arg_names
-            out_reg += offset
-            op = "load"
-            arg_names = (addr,)
-
-        if self.op == "valu_scalar":
-            # Instructions look like this:
-            # valu_scalar partial_dest_0 op a1, a2, 0
-            # Turn into alu op dest, a1, a2 (add the offset to both registers)
-            op, a1, a2, offset = arg_names
-            out_reg += offset
-            arg_names = (a1, a2)
-
-        def to_reg(name: str) -> int:
-            if is_const(name):
-                name = deconst(name)
-                assert name in consts, f"name {name} not found in consts"
-                return consts[name]
-            assert name in using, f"name {name} not found in using"
-            return using[name] + offset
-
-        # Translate all input arguments
-        args = [to_reg(arg) for arg in arg_names]
-        # Add dest
-        if self.dest is not None:
-            args = [out_reg] + args
-        return self.engine, (op, *args)
-
-    def to_concrete_alu_offload(
-        self,
-        using: dict[str, int],
-        consts: dict[str, int],
-        out_reg: Optional[int] = None,
-    ) -> list[tuple]:
-        assert self.engine == "valu"
-        assert self.op not in ("multiply_add", "vbroadcast")
-        # turn into 8 scalar instructions
-        assert self.dest is not None
-        assert out_reg is not None
-
-        # Translate all input arguments
-        def to_reg(name: str, offset: int) -> int:
-            if is_const(name):
-                name = deconst(name)
-                assert name in consts, f"name {name} not found in consts"
-                return consts[name]
-            assert name in using, f"name {name} not found in using"
-            return using[name] + offset
-
-        def to_inst(offset: int) -> tuple:
-            args = [to_reg(arg, offset) for arg in self.arg_names]
-            # Add dest with offset for each lane
-            return (self.op, out_reg + offset, *args)
-
-        return [to_inst(i) for i in range(8)]
-
-
-def make_slot(
-    op: str, arg_names: list[str], dest: Optional[str] = None
-) -> SymbolicInstructionSlot:
-    engine, op = infer_engine(op)
-    return SymbolicInstructionSlot(
-        engine=engine,
-        op=op,
-        arg_names=tuple(arg_names),
-        dest=dest,
-    )
-
-
-# Computation graph of VLIW slots that can be merged with other graphs.
-class ComputationGraph:
-    def __init__(self):
-        self.graph = nx.DiGraph()
-
-        # Temporary staging while we build the graph.
-        self.inner_defs: dict[str, SymbolicInstructionSlot] = {}
-
-        # Incoming edges (external dependencies). Which slots depend on a given outside variable?
-        self.ext_deps: dict[str, list[SymbolicInstructionSlot]] = defaultdict(list)
-        # Outgoing edges (exported variables).
-        self.exports: dict[str, SymbolicInstructionSlot] = {}
-
-    def add_edge(
-        self,
-        from_node: SymbolicInstructionSlot,
-        to_node: SymbolicInstructionSlot,
-        var: str,  # can be either the dest or FAKE
-    ):
-        assert from_node in self.graph, f"originating node {from_node} must be in graph"
-        assert to_node in self.graph, f"destination node {to_node} must be in graph"
-        assert var == "FAKE" or var == from_node.dest, (
-            f"var {var} is not the dest or FAKE"
-        )
-        self.graph.add_edge(from_node, to_node, data=var)
-
-    # Must add slots in dependency order.
-    # The last slot added to the graph must be marked. This defines the export.
-    def add_slot(self, slot: SymbolicInstructionSlot, exports=False):
-        self.graph.add_node(slot)
-
-        # Check that dependencies satisfied, and draw incoming edges
-        for arg in slot.dependencies:
-            # Inner defs take precedence over upper defs
-            if arg in self.inner_defs:
-                # Draw edge from inner def's node to this one
-                # We don't need to mark with var name, because it's always the same as the originating node's `dest`
-                # TODO not true anymore! fake deps possible
-                self.add_edge(self.inner_defs[arg], slot, var=arg)
-                continue
-            # Otherwise, we need this variable from outside our graph. Add to external dependencies; we will draw the edge later.
-            self.ext_deps[arg].append(slot)
-
-        # if this slot defines a new variable, add to inner_defs
-        # inner variables must be unique!
-        if slot.has_def:
-            assert slot.dest not in self.inner_defs, (
-                f"inner variable {slot.dest} is already defined"
-            )
-            self.inner_defs[slot.dest] = slot
-
-        if exports:
-            self.exports[slot.dest] = slot
-
-    def add_new_slot(
-        self, op: str, arg_names: list[str], dest: Optional[str] = None, exports=False
-    ):
-        self.add_slot(make_slot(op, arg_names, dest=dest), exports=exports)
-
-    # Add another computation graph "below" this one.
-    # `other` must have external dependencies that are either our external dependencies or things that we export.
-    # `other`'s exports become part of our inner defs.
-    def merge_below(self, other: "ComputationGraph"):
-        # Merge, then add edges connecting them.
-        self.graph = nx.union(self.graph, other.graph)
-        # Link up our outgoing edges to `other`'s incoming edges.
-        for var_name, slots in other.ext_deps.items():
-            # If this graph has slots depending on something we produce, then we add edges connecting them.
-            if var_name in self.inner_defs:
-                for slot in slots:
-                    self.graph.add_edge(self.inner_defs[var_name], slot, var=var_name)
-                continue
-            # Otherwise, we add it as another external dependency.
-            self.ext_deps[var_name].extend(slots)
-
-        # `other`'s outgoing edges become part of our graph, but as inner defs
-        for var_name, slot in other.exports.items():
-            # Make sure we're not already exporting this variable name
-            assert var_name not in self.exports
-            assert var_name not in self.inner_defs
-            self.inner_defs[var_name] = slot
 
 
 class FullComputationGraph:
@@ -740,231 +313,6 @@ class FullComputationGraph:
         while self.has_more_work:
             bundle = self.schedule()
             code.append(bundle)
-        assert len(self.scalar_freelist) == orig_sfreelist_len
-        assert len(self.vector_freelist) == orig_vfreelist_len
-        return code
-
-    def schedule_optimal(
-        self, time_limit: float = 120.0
-    ) -> dict[SymbolicInstructionSlot, int] | None:
-        """
-        Use CP-SAT to find optimal schedule minimizing cycles while respecting:
-        - Slot limits per engine per cycle
-        - Dependency ordering
-        - Register pressure limits
-
-        Returns: dict mapping each node to its scheduled cycle, or None if infeasible
-        """
-        model = cp_model.CpModel()
-        nodes = list(self.graph.nodes())
-        n = len(nodes)
-        node_to_idx = {node: i for i, node in enumerate(nodes)}
-
-        # Upper bound on makespan (worst case: fully sequential)
-        T = n
-
-        # === DECISION VARIABLES ===
-        # start[i] = cycle when instruction i is scheduled
-        start = [model.NewIntVar(0, T - 1, f"start_{i}") for i in range(n)]
-
-        # Makespan to minimize
-        makespan = model.NewIntVar(1, T, "makespan")
-
-        # === CONSTRAINT 1: Makespan definition ===
-        for i in range(n):
-            model.Add(makespan >= start[i] + 1)
-
-        # === CONSTRAINT 2: Dependencies ===
-        for pred, succ in self.graph.edges():
-            pi, si = node_to_idx[pred], node_to_idx[succ]
-            model.Add(start[si] >= start[pi] + 1)
-
-        # === CONSTRAINT 3: Slot limits per cycle ===
-        # Group nodes by engine
-        engine_nodes: dict[str, list[int]] = {eng: [] for eng in SLOT_LIMITS}
-        for i, node in enumerate(nodes):
-            if node.engine in SLOT_LIMITS:
-                engine_nodes[node.engine].append(i)
-
-        # For each engine, at most slot_limits[engine] can run at same time
-        for engine, limit in SLOT_LIMITS.items():
-            if not engine_nodes[engine]:
-                continue
-
-            # Create interval variables of size 1 for each instruction
-            intervals = []
-            for i in engine_nodes[engine]:
-                interval = model.NewFixedSizeIntervalVar(
-                    start[i], 1, f"slot_{engine}_{i}"
-                )
-                intervals.append(interval)
-
-            # Cumulative: at most `limit` intervals overlap at any point
-            demands = [1] * len(intervals)
-            model.AddCumulative(intervals, demands, limit)
-
-        # === CONSTRAINT 4: Register pressure ===
-        # Build live intervals for each variable definition
-
-        scalar_intervals = []
-        vector_intervals = []
-
-        for i, node in enumerate(nodes):
-            if node.dest is None:
-                continue
-
-            # Find all consumers (successors that use this variable)
-            consumers = []
-            for succ in self.graph.successors(node):
-                si = node_to_idx[succ]
-                if node.dest in nodes[si].dependencies:
-                    consumers.append(si)
-
-            if not consumers:
-                # No consumers = no live range needed
-                continue
-
-            # Live range: from (start[i] + 1) to (max consumer start + 1)
-            # The +1 on start[i] is because the value isn't live until AFTER the instruction
-
-            # end[i] = max(start[j] for j in consumers) + 1
-            end = model.NewIntVar(1, T, f"end_{i}")
-            for j in consumers:
-                model.Add(end >= start[j] + 1)
-
-            # Duration of live range
-            size = model.NewIntVar(0, T, f"size_{i}")
-            model.Add(size == end - start[i] - 1)
-
-            # Interval from (start[i]+1) with length (size), ending at (end)
-            live_start = model.NewIntVar(0, T, f"live_start_{i}")
-            model.Add(live_start == start[i] + 1)
-
-            interval = model.NewIntervalVar(live_start, size, end, f"live_{i}")
-
-            # Categorize by register type
-            dest = node.dest
-            if is_partial(dest):
-                dest = get_partial_vname(dest)
-
-            if is_vector(dest):
-                vector_intervals.append(interval)
-            elif is_scalar(dest):
-                scalar_intervals.append(interval)
-
-        # At most num_scalar_regs scalar values live at once
-        num_scalar_regs = len(self.scalar_freelist)
-        num_vector_regs = len(self.vector_freelist)
-
-        if scalar_intervals:
-            model.AddCumulative(
-                scalar_intervals, [1] * len(scalar_intervals), num_scalar_regs
-            )
-
-        if vector_intervals:
-            model.AddCumulative(
-                vector_intervals, [1] * len(vector_intervals), num_vector_regs
-            )
-
-        # === OBJECTIVE ===
-        model.Minimize(makespan)
-
-        # === SOLVE ===
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = time_limit
-        solver.parameters.num_search_workers = 8  # Parallel search
-        solver.parameters.log_search_progress = True  # Show progress
-
-        # Callback to print each new solution found
-        class SolutionCallback(cp_model.CpSolverSolutionCallback):
-            def __init__(self, makespan_var):
-                super().__init__()
-                self._makespan = makespan_var
-                self._solution_count = 0
-
-            def on_solution_callback(self):
-                self._solution_count += 1
-                print(
-                    f"  Solution {self._solution_count}: makespan = {self.Value(self._makespan)} cycles"
-                )
-
-        callback = SolutionCallback(makespan)
-        status = solver.Solve(model, callback)
-
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            schedule = {nodes[i]: solver.Value(start[i]) for i in range(n)}
-            print(f"CP-SAT Makespan: {solver.Value(makespan)} cycles")
-            print(f"Status: {'OPTIMAL' if status == cp_model.OPTIMAL else 'FEASIBLE'}")
-            return schedule
-
-        print(f"CP-SAT: No solution found. Status: {solver.StatusName(status)}")
-        return None
-
-    def generate_code_optimal(self, time_limit: float = 120.0):
-        """
-        Generate code using CP-SAT optimal scheduler.
-        Falls back to greedy scheduler if CP-SAT fails.
-        """
-        schedule = self.schedule_optimal(time_limit=time_limit)
-
-        if schedule is None:
-            print("Falling back to greedy scheduler")
-            return self.generate_code()
-
-        # Group nodes by cycle
-        max_cycle = max(schedule.values())
-        bundles_by_cycle: list[list[SymbolicInstructionSlot]] = [
-            [] for _ in range(max_cycle + 1)
-        ]
-        for node, cycle in schedule.items():
-            bundles_by_cycle[cycle].append(node)
-
-        # Process in topological order within each cycle for deterministic register allocation
-        code = []
-        orig_sfreelist_len = len(self.scalar_freelist)
-        orig_vfreelist_len = len(self.vector_freelist)
-
-        # Track refcounts for register freeing
-        refcounts = defaultdict(int)
-        for node in self.graph.nodes():
-            for succ in self.graph.successors(node):
-                if node.dest and node.dest in succ.dependencies:
-                    refcounts[node.dest] += 1
-
-        for cycle_nodes in bundles_by_cycle:
-            bundle = defaultdict(list)
-
-            for node in cycle_nodes:
-                if node.engine == "NO-OP":
-                    # Handle vmerge noops - just track refcounts
-                    continue
-
-                # Allocate output register
-                out_reg = None
-                if node.dest is not None:
-                    out_reg = self.alloc_outreg(node.dest)
-
-                # Convert to concrete instruction
-                engine, inst = node.to_concrete(
-                    self.using, self.consts, out_reg=out_reg
-                )
-                bundle[engine].append(inst)
-
-                # Decrement refcounts and free registers
-                for arg in node.dependencies:
-                    refcounts[arg] -= 1
-                    if refcounts[arg] == 0 and arg in self.using:
-                        if is_partial(arg):
-                            continue
-                        reg = self.using.pop(arg)
-                        if is_vector(arg):
-                            self.vector_freelist.add(reg)
-                        else:
-                            self.scalar_freelist.add(reg)
-
-            if bundle:  # Don't add empty bundles
-                code.append(dict(bundle))
-
         assert len(self.scalar_freelist) == orig_sfreelist_len
         assert len(self.vector_freelist) == orig_vfreelist_len
         return code
@@ -1935,13 +1283,13 @@ def make_all_batches_graph(
         graph.add_edge(from_node, to_node, data="FAKE")
 
     # serialize batch0 123, batch8 123, batch16 123, etc
-    # for i in range(batch_size, VLEN):
-    #     if i - VLEN < 0:
-    #         continue
-    #     # dep. between previous vout and current vin
-    #     add_fake_dep(
-    #         all_batch_slots[(i, 3, "vout")], all_batch_slots[(i - VLEN, 1, "vin")]
-    #     )
+    for i in range(batch_size, VLEN):
+        if i - VLEN < 0:
+            continue
+        # dep. between previous vout and current vin
+        add_fake_dep(
+            all_batch_slots[(i, 3, "vout")], all_batch_slots[(i - VLEN, 1, "vin")]
+        )
 
     # N_CONCURRENT_BATCHES = 4
     # batches 0*VLEN, 1*VLEN, ..., (N_CONCURRENT_BATCHES-1)*VLEN can run at the same time
@@ -1989,12 +1337,475 @@ def make_kernel_graph(
     vector_freelist: set[int],
     consts: dict[str, int],
 ) -> FullComputationGraph:
+    # make all the batches, and merge_below into const
     return FullComputationGraph(
         make_all_batches_graph(forest_height, batch_size, rounds),
         scalar_freelist,
         vector_freelist,
         consts,
     )
+
+
+# BELOW THIS LINE IS WHERE NEW CODE IS
+# TODO:
+# - get rid of vload_scalar, valu_scalar; replace with (vreg @ i) syntax
+# ----------------------------------------
+
+CONST_PREFIX = "const "
+VECTOR_PREFIX = "v_"
+
+# generally, we can have these things in arguments:
+# - strings, for variable names. these can be constant vectors, constant scalars, vectors, or scalars.
+#   - note that constant takes precedence over vector -- the const prefix comes first
+# - integers, for args to `const` instruction ONLY
+# - 2-tuples of (str, int) -- this must be a vector register and an integer index in [0, 8).
+Arg = Union[str, int, tuple[str, int]]
+
+
+# Helpers to effectively rename things.
+def const(name: str) -> str:
+    return f"{CONST_PREFIX}{name}"
+
+
+def constn(n: int) -> str:
+    return f"{CONST_PREFIX}{n}"
+
+
+def vector(name: str) -> str:
+    return f"{VECTOR_PREFIX}{name}"
+
+
+def vconst(name: str) -> str:
+    return const(vector(name))
+
+
+def vconstn(n: int) -> str:
+    return const(vector(str(n)))
+
+
+# Detection functions; conversions.
+# This uses Arg type.
+def is_const(arg: Arg) -> bool:
+    assert not isinstance(arg, int)
+    if isinstance(arg, tuple):
+        vname, offset = arg
+        assert isinstance(vname, str) and isinstance(offset, int)
+        return is_const(vname)
+    return arg.startswith(CONST_PREFIX)
+
+
+def is_vector(arg: Arg) -> bool:
+    assert not isinstance(arg, int)
+    if isinstance(arg, tuple):
+        return False
+    if is_const(arg):
+        return is_vector(deconst(arg))
+    return arg.startswith(VECTOR_PREFIX)
+
+
+def deconst(name: str) -> str:
+    assert is_const(name)
+    return name[len(CONST_PREFIX) :]
+
+
+def is_scalar(arg: Arg) -> bool:
+    assert not isinstance(arg, int)
+    if isinstance(arg, tuple):
+        vname, offset = arg
+        assert isinstance(vname, str) and isinstance(offset, int)
+        # vname must be a vector register
+        return is_vector(vname)
+    return not is_vector(arg)
+
+
+def batch_localize(name: str, batch: int) -> str:
+    # Don't apply this twice.
+    tokens = name.split("_")
+    assert not (len(tokens) >= 1 and tokens[-1].startswith("batch"))
+    return f"{name}_batch{batch}"
+
+
+# Localization, for batch/round-specific variable names.
+def localize(name: str, batch: int, round: int) -> str:
+    # Don't apply this twice either.
+    tokens = name.split("_")
+    assert not (len(tokens) >= 1 and tokens[-1].startswith("round"))
+    return f"{batch_localize(name, batch)}_round{round}"
+
+
+def vlocalize(name: str, batch: int, round: int) -> str:
+    return vector(localize(name, batch, round))
+
+
+def vbatch_localize(name: str, batch: int) -> str:
+    return vector(batch_localize(name, batch))
+
+
+# The only new op we define is vmerge; this becomes a no-op.
+def infer_engine(op: str) -> (Engine, str):
+    engine = None
+    if op == "vmerge":
+        engine = "NO-OP"
+    elif "load" in op or "const" in op:
+        engine = "load"
+    elif "store" in op:
+        engine = "store"
+    elif op in ("+", "-", "*", "//", "cdiv", "^", "&", "|", "<<", ">>", "%", "<", "=="):
+        engine = "alu"
+    elif op in ("multiply_add", "vbroadcast"):
+        engine = "valu"
+    elif "valu" in op:
+        engine = "valu"
+        op = op[len("valu") :]
+    elif op in (
+        "select",
+        "add_imm",
+        "vselect",
+        "halt",
+        "pause",
+        "trace_write",
+        "cond_jump",
+        "cond_jump_rel",
+        "jump",
+        "jump_indirect",
+        "coreid",
+    ):
+        engine = "flow"
+    else:
+        engine = "debug"
+
+    assert engine is not None, f"invalid engine: {op}"
+
+    return engine, op
+
+
+ALU_OPS = {
+    "+",
+    "-",
+    "*",
+    "//",
+    "cdiv",
+    "^",
+    "&",
+    "|",
+    "<<",
+    ">>",
+    "%",
+    "<",
+    "==",
+}
+
+
+# Must be hashable to be added to DiGraph
+@dataclass(frozen=True)
+class SymbolicInstructionSlot:
+    engine: Engine
+    op: str
+    args: tuple[Arg, ...]  # the only time we don't get Arg type is for `const`
+    dest: Optional[Arg] = None
+    # Useful for if we want to impose concurrency limits later.
+    batch: int
+    round: int
+    # Debugging purposes.
+    comment: str = ""
+
+    # Check that all variable names follow conventions/are valid for the given engine + op combo.
+    # Also that the proper number of arguments are passed, and that the destination is properly defined.
+    # Avoids syntax errors.
+    def __post_init__(self):
+        match self.engine:
+            case "alu":
+                # should be like alu, op: dest <- arg1, arg2
+                assert self.dest is not None
+                assert len(self.args) == 2
+                assert all(not isinstance(arg, int) for arg in self.args)
+                assert all(is_scalar(arg) for arg in self.args)
+                assert is_scalar(self.dest)
+            case "valu":
+                # should be like valu, op: dest <- varg1, varg2
+                # except for vbroadcast: 1 scalar arg
+                # and multiply_add: vargmul1, vargmul2, vargadd
+                assert self.dest is not None
+                assert is_vector(self.dest)
+                if self.op == "vbroadcast":
+                    assert len(self.args) == 1
+                    assert is_scalar(self.args[0])
+                elif self.op == "multiply_add":
+                    assert len(self.args) == 3
+                    assert all(is_vector(arg) for arg in self.args)
+                else:
+                    assert self.op in ALU_OPS
+                    assert len(self.args) == 2
+                    assert all(is_vector(arg) for arg in self.args)
+            case "load":
+                # either vload or load; both load from scalar address
+                assert self.dest is not None
+                assert len(self.args) == 1
+                assert is_scalar(self.args[0])
+                if self.op == "vload":
+                    assert is_vector(self.dest)
+                elif self.op == "const":
+                    assert len(self.args) == 1
+                    assert isinstance(self.args[0], int)
+                else:
+                    assert self.op == "load"
+                    assert is_scalar(self.dest)
+            case "store":
+                # either vstore or store; both store to scalar address
+                assert self.dest is None
+                assert len(self.args) == 2
+                assert is_scalar(self.args[0])
+                if self.op == "vstore":
+                    assert is_vector(self.args[1])
+                else:
+                    assert self.op == "store"
+                    assert is_scalar(self.args[1])
+            case "flow":
+                if self.op == "vselect":
+                    assert self.dest is not None
+                    assert len(self.args) == 3
+                    assert all(is_vector(arg) for arg in self.args)
+                else:
+                    assert self.op == "pause"
+            case "NO-OP":
+                # vmerge looks like vmerge vreg, vreg @ 0, vreg @ 1,...
+                assert self.op == "vmerge"
+                assert self.dest is not None
+                assert is_vector(self.dest)
+                assert len(self.args) == 8
+                assert all(is_scalar(arg) for arg in self.args)
+                assert all(isinstance(arg, tuple) for arg in self.args)
+                assert all(len(tup) == 2 for tup in self.args)
+                # should all have the same name as dest
+                names = [arg[0] for arg in self.args]
+                assert len(set(names)) == 1
+                assert names[0] == self.dest
+                # and all offsets 0 to 7
+                offsets = [arg[1] for arg in self.args]
+                assert set(offsets) == set(range(8))
+            case "debug":
+                # anything works lmfao
+                return
+
+    # Get all variables that this slot depends on.
+    # This time, includes constants!
+    @property
+    def dependencies(self) -> set[str]:
+        def is_var(arg: Arg) -> bool:
+            if isinstance(arg, int):
+                return False
+            # everything can be a dependency now, even constants!
+            return True
+
+        return {arg for arg in self.args if is_var(arg)}
+
+    @property
+    def has_def(self) -> bool:
+        return self.dest is not None
+
+    # TODO: find a better heuristic?
+    @property
+    def is_notable(self) -> bool:
+        return self.engine == "load" or self.engine == "store"
+
+    def to_concrete(
+        self,
+        using: dict[str, int],
+        out_reg: Optional[int] = None,
+    ) -> (Engine, tuple):
+        if self.dest is None:
+            assert out_reg is None
+        else:
+            assert out_reg is not None
+        # Resolution/translation happens here.
+        assert self.engine != "NO-OP"
+
+        def to_reg(arg: Arg) -> int:
+            if isinstance(arg, int):
+                return arg
+            # This is an offset
+            if isinstance(arg, tuple):
+                vname, offset = arg
+                assert vname in using
+                return using[vname] + offset
+            # normal var
+            assert arg in using
+            return using[arg]
+
+        # Translate all input arguments; add dest if needed
+        args = [to_reg(arg) for arg in self.args]
+        if self.dest is not None:
+            args = [out_reg] + args
+        return self.engine, (self.op, *args)
+
+
+def make_slot(
+    op: str,
+    args: list[Arg],
+    dest: Optional[str] = None,
+    batch: Optional[int] = None,
+    round: Optional[int] = None,
+    comment: Optional[str] = "",
+) -> SymbolicInstructionSlot:
+    engine, op = infer_engine(op)
+    return SymbolicInstructionSlot(
+        engine=engine,
+        op=op,
+        args=tuple(args),
+        dest=dest,
+        batch=batch,
+        round=round,
+        comment=comment,
+    )
+
+
+# Computation graph of VLIW slots that can be merged with other graphs.
+# TODO finish editing
+class ComputationGraph:
+    def __init__(self):
+        self.graph = nx.DiGraph()
+
+        # Temporary staging while we build the graph.
+        self.inner_defs: dict[str, SymbolicInstructionSlot] = {}
+
+        # Incoming edges (external dependencies). Which slots depend on a given outside variable?
+        self.ext_deps: dict[str, list[SymbolicInstructionSlot]] = defaultdict(list)
+        # Outgoing edges (exported variables).
+        self.exports: dict[str, SymbolicInstructionSlot] = {}
+
+    def add_edge(
+        self,
+        from_node: SymbolicInstructionSlot,
+        to_node: SymbolicInstructionSlot,
+        var: str,  # can be either the dest or FAKE
+    ):
+        assert from_node in self.graph, f"originating node {from_node} must be in graph"
+        assert to_node in self.graph, f"destination node {to_node} must be in graph"
+        assert var == "FAKE" or var == from_node.dest, (
+            f"var {var} is not the dest or FAKE"
+        )
+        self.graph.add_edge(from_node, to_node, data=var)
+
+    # Must add slots in dependency order.
+    # The last slot added to the graph must be marked. This defines the export.
+    def add_slot(self, slot: SymbolicInstructionSlot, exports=False):
+        self.graph.add_node(slot)
+
+        # Check that dependencies satisfied, and draw incoming edges
+        for arg in slot.dependencies:
+            # Inner defs take precedence over upper defs
+            if arg in self.inner_defs:
+                # Draw edge from inner def's node to this one
+                # We don't need to mark with var name, because it's always the same as the originating node's `dest`
+                # TODO not true anymore! fake deps possible
+                self.add_edge(self.inner_defs[arg], slot, var=arg)
+                continue
+            # Otherwise, we need this variable from outside our graph. Add to external dependencies; we will draw the edge later.
+            self.ext_deps[arg].append(slot)
+
+        # if this slot defines a new variable, add to inner_defs
+        # inner variables must be unique!
+        if slot.has_def:
+            assert slot.dest not in self.inner_defs, (
+                f"inner variable {slot.dest} is already defined"
+            )
+            self.inner_defs[slot.dest] = slot
+
+        if exports:
+            self.exports[slot.dest] = slot
+
+    def add_new_slot(
+        self, op: str, arg_names: list[str], dest: Optional[str] = None, exports=False
+    ):
+        self.add_slot(make_slot(op, arg_names, dest=dest), exports=exports)
+
+    # Add another computation graph "below" this one.
+    # `other` must have external dependencies that are either our external dependencies or things that we export.
+    # `other`'s exports become part of our inner defs.
+    def merge_below(self, other: "ComputationGraph"):
+        # Merge, then add edges connecting them.
+        self.graph = nx.union(self.graph, other.graph)
+        # Link up our outgoing edges to `other`'s incoming edges.
+        for var_name, slots in other.ext_deps.items():
+            # If this graph has slots depending on something we produce, then we add edges connecting them.
+            if var_name in self.inner_defs:
+                for slot in slots:
+                    self.graph.add_edge(self.inner_defs[var_name], slot, var=var_name)
+                continue
+            # Otherwise, we add it as another external dependency.
+            self.ext_deps[var_name].extend(slots)
+
+        # `other`'s outgoing edges become part of our graph, but as inner defs
+        for var_name, slot in other.exports.items():
+            # Make sure we're not already exporting this variable name
+            assert var_name not in self.exports
+            assert var_name not in self.inner_defs
+            self.inner_defs[var_name] = slot
+
+
+def make_const_graph() -> ComputationGraph:
+    graph = ComputationGraph()
+    # Scalar constants: numerical, VLEN, and hash
+    for i in (0, 1, 2, 3, 4, 5, 6, 7):
+        graph.add_new_slot("const", [i], dest=constn(i))
+    s_vlen = const("s_vlen")
+    graph.add_new_slot("const", [VLEN], dest=s_vlen)
+    for i, (_, add_imm, _, _, shift_imm) in enumerate(HASH_STAGES):
+        if i in (0, 2, 4):
+            shift_imm = 1 + 2**shift_imm
+        graph.add_new_slot("const", [add_imm], dest=const(f"hash_add{i}"))
+        graph.add_new_slot("const", [shift_imm], dest=const(f"hash_mult{i}"))
+    # vload the initial variables
+    init_vars = vconst("init_vars")
+    graph.add_new_slot("vload", [constn(0)], dest=init_vars)
+
+    # Address calculations
+    treevals_addr8, treevals_addr16, treevals_addr24 = (
+        vector(f"treevals_addr{i}") for i in (8, 16, 24)
+    )
+    graph.add_new_slot("+", [(init_vars, 3), s_vlen], dest=treevals_addr8)
+    graph.add_new_slot("+", [treevals_addr8, s_vlen], dest=treevals_addr16)
+    graph.add_new_slot("+", [treevals_addr16, s_vlen], dest=treevals_addr24)
+
+    # vloads
+    treevals_starting0, treevals_starting8, treevals_starting16, treevals_starting24 = (
+        vconst(f"treevals_starting{i}") for i in (0, 8, 16, 24)
+    )
+    graph.add_new_slot("vload", [(init_vars, 3)], dest=treevals_starting0)
+    graph.add_new_slot("vload", [treevals_addr8], dest=treevals_starting8)
+    graph.add_new_slot("vload", [treevals_addr16], dest=treevals_starting16)
+    graph.add_new_slot("vload", [treevals_addr24], dest=treevals_starting24)
+
+    # vbroadcast tree values
+    for i in range(8):
+        graph.add_new_slot(
+            "vbroadcast", [(treevals_starting0, i)], dest=vconst(f"treeval{i}")
+        )
+    for i in range(8):
+        graph.add_new_slot(
+            "vbroadcast", [treevals_starting8, i], dest=vconst(f"treeval{8 + i}")
+        )
+    for i in range(8):
+        graph.add_new_slot(
+            "vbroadcast", [treevals_starting16, i], dest=vconst(f"treeval{16 + i}")
+        )
+    for i in range(8):
+        graph.add_new_slot(
+            "vbroadcast", [treevals_starting24, i], dest=vconst(f"treeval{24 + i}")
+        )
+    # vbroadcast hash values
+    for i in range(len(HASH_STAGES)):
+        graph.add_new_slot(
+            "vbroadcast", [const(f"hash_add{i}")], dest=vconst(f"hash_add{i}")
+        )
+        graph.add_new_slot(
+            "vbroadcast", [const(f"hash_mult{i}")], dest=vconst(f"hash_mult{i}")
+        )
+    # vbroadcast forest_values_p pointer
+    graph.add_new_slot("vbroadcast", [(init_vars, 3)], dest=vconst("forest_values_p"))
+    # vbroadcast i values
+    for i in (1, 2, 3, 7, 15):
+        graph.add_new_slot("vbroadcast", [constn(i)], dest=vconstn(i))
 
 
 class KernelBuilder:
@@ -2008,27 +1819,6 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def make_bundle(self, **kwargs):
-        vliw_inst = {
-            "alu": kwargs.get("alu", []),
-            "valu": kwargs.get("valu", []),
-            "load": kwargs.get("load", []),
-            "store": kwargs.get("store", []),
-            "flow": kwargs.get("flow", []),
-            "debug": kwargs.get("debug", []),
-        }
-        assert all(
-            len(vliw_inst[engine]) <= SLOT_LIMITS[engine] for engine in vliw_inst
-        ), "instruction exceeded slot limit"
-        return vliw_inst
-
-    def add_bundle(self, **kwargs):
-        self.instrs.append(self.make_bundle(**kwargs))
-
-    def add(self, engine, slot):
-        assert engine in ("flow", "debug"), "only flow and debug can be entire cycles"
-        self.instrs.append({engine: [slot]})
-
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
@@ -2038,293 +1828,14 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def build_const_mapping(self):
-        const_mapping = {}
-
-        # The only const registers we need to retain are:
-        # scalar: forest_values_p, inp_values_p, 01234, s_vlen
-        # vector: 1237, treeval0135791113, diff21, 43, 65, 87, 109, 1211, 1413, hash_mults and hash_adds
-
-        # Notably:
-        # - forest_values_p and inp_values_p are part of init_vars, can return the other 6 scalar regs
-        # - 7 is loaded in a scalar, we broadcast it, and then can return the scalar reg.
-        # - We load treevals 0-15, compute 7 diffs, and then throw away 2, 4, 6, 8, 10, 12, 14.
-        # hash_adds and hash_mults are loaded in scalars and broadcasted; we can return the scalar regs.
-
-        # Game plan:
-        # Scalar loads: 012347, s_vlen, hash vals
-        # Vector loads: init vars, treevals starting 0 and 8
-        # Vector broadcasts: 1237, treevals 0 to 14, hash vals
-        # vdiffs: diff21, 43, 65, 87, 109, 1211, 1413
-
-        # Can throw away:
-        # scalar: 7, init vars except for forest/inp_p, hash vals (?) we might have to come back to this if we want to be able to offload to regular ALU. TODO fix
-        # vector: treeval vectors at 0 and 8 (staging area), vtreeval 2, 4, 8, 12, 14
-
-        # Input is list of (name, concrete value).
-        # We allocate scratch space, load with const, and register in const_mapping.
-        # Returns the loads we need to perform, as a map from name to load instruction.
-        def build_scalar_constants(scalars: list[tuple[str, int]]):
-            loads = {}
-            for name, val in scalars:
-                reg = self.alloc_scratch()
-                loads[name] = ("const", reg, val)
-                assert name not in const_mapping, f"Constant {name} already registered"
-                const_mapping[name] = reg
-            return loads
-
-        SCALARS = list(range(5)) + [7, 15]
-
-        num_loads = build_scalar_constants([(str(i), i) for i in SCALARS])
-        vlen_loads = build_scalar_constants([("s_vlen", VLEN)])
-        hash_add_loads = build_scalar_constants(
-            [(f"hash_add{i}", imm) for i, (_, imm, _, _, _) in enumerate(HASH_STAGES)]
-        )
-        hash_mult_loads = build_scalar_constants(
-            [
-                (f"hash_mult{i}", 1 + 2**shift if i in (0, 2, 4) else shift)
-                for i, (_, _, _, _, shift) in enumerate(HASH_STAGES)
-            ]
-        )
-
-        # Input is list of names and register holding address to load from.
-        # Allocate scratch space, load with vload, and register individual lanes in const_mapping.
-        # Returns the vload to perform.
-        def vload_const_batch(names: list[str], addr_reg: int):
-            assert len(names) <= VLEN, "Too many names for vload_const_batch"
-            base = self.alloc_scratch(length=VLEN)
-            for i, name in enumerate(names):
-                const_mapping[name] = base + i
-            return ("vload", base, addr_reg)
-
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        init_vars_vload = vload_const_batch(init_vars, const_mapping["0"])
-        treevals0_vload = vload_const_batch(
-            [f"treeval{i}" for i in range(VLEN)], const_mapping["forest_values_p"]
-        )
-
-        # use 7's reg as scratch after broadcasting and before returning
-        treeval8_addr_calc = (
-            "+",
-            const_mapping["7"],
-            const_mapping["forest_values_p"],
-            const_mapping["s_vlen"],
-        )
-        treevals8_vload = vload_const_batch(
-            [f"treeval{i}" for i in range(VLEN, 2 * VLEN)], const_mapping["7"]
-        )
-
-        treeval16_addr_calc = (
-            "+",
-            const_mapping["7"],
-            const_mapping["7"],
-            const_mapping["s_vlen"],
-        )
-        treevals16_vload = vload_const_batch(
-            [f"treeval{i}" for i in range(2 * VLEN, 3 * VLEN)], const_mapping["7"]
-        )
-        treeval24_addr_calc = (
-            "+",
-            const_mapping["7"],
-            const_mapping["7"],
-            const_mapping["s_vlen"],
-        )
-        treevals24_vload = vload_const_batch(
-            [f"treeval{i}" for i in range(3 * VLEN, 4 * VLEN)], const_mapping["7"]
-        )
-
-        # Input is list of (name, reg holding scalar val).
-        # We allocate scratch space, broadcast the scalar, and register in const_mapping.
-        # Returns the broadcasts we need to perform, as a map from name to broadcast instruction.
-        def build_vector_constants(vectors: list[tuple[str, int]]):
-            broadcasts = {}
-            for name, reg in vectors:
-                vbase_reg = self.alloc_scratch(length=VLEN)
-                const_mapping[name] = vbase_reg
-                broadcasts[name] = ("vbroadcast", vbase_reg, reg)
-            return broadcasts
-
-        num_vbroadcasts = build_vector_constants(
-            [(vector(str(i)), const_mapping[str(i)]) for i in (1, 2, 3, 7, 15)]
-        )
-        treeval_vbroadcasts = build_vector_constants(
-            [
-                (vector(f"treeval{i}"), const_mapping[f"treeval{i}"])
-                for i in range(0, VLEN * 4 - 1)
-            ]
-        )
-        hash_add_vbroadcasts = build_vector_constants(
-            [
-                (vector(f"hash_add{i}"), const_mapping[f"hash_add{i}"])
-                for i in range(len(HASH_STAGES))
-            ]
-        )
-        hash_mult_vbroadcasts = build_vector_constants(
-            [
-                (vector(f"hash_mult{i}"), const_mapping[f"hash_mult{i}"])
-                for i in range(len(HASH_STAGES))
-            ]
-        )
-        forest_vals_vbroadcasts = build_vector_constants(
-            [(vector("forest_values_p"), const_mapping["forest_values_p"])]
-        )
-
-        # valu's for diffs
-        vdiff21, vdiff43, vdiff65, vdiff87, vdiff109, vdiff1211, vdiff1413 = [
-            self.alloc_scratch(length=VLEN) for i in range(7)
-        ]
-        vdiff_info = list(
-            zip(
-                [vdiff21, vdiff43, vdiff65, vdiff87, vdiff109, vdiff1211, vdiff1413],
-                [2, 4, 6, 8, 10, 12, 14],
-                [1, 3, 5, 7, 9, 11, 13],
-            )
-        )
-        vdiff_valus = {
-            vector(f"diff{i1}{i2}"): (
-                "-",
-                vreg,
-                const_mapping[vector(f"treeval{i1}")],
-                const_mapping[vector(f"treeval{i2}")],
-            )
-            for vreg, i1, i2 in vdiff_info
-        }
-        for s, (_, vreg, i1, i2) in vdiff_valus.items():
-            const_mapping[s] = vreg
-
-        scalars_to_return = ["7"] + [
-            s for s in init_vars if s not in ("forest_values_p", "inp_values_p")
-        ]
-        scalar_return = {const_mapping.pop(s) for s in scalars_to_return}
-
-        vectors_to_return = []
-        # ["treeval0", "treeval8"] + [
-        #     vector(f"treeval{i}") for i in (2, 4, 8, 12, 14)
-        # ]
-        vector_return = {const_mapping.pop(v) for v in vectors_to_return}
-        for i in range(1, VLEN):
-            del const_mapping[f"treeval{i}"]
-        for i in range(9, VLEN * 2):
-            del const_mapping[f"treeval{i}"]
-
-        MAX_CYCLES = 20
-        load_bundles = [[] for _ in range(MAX_CYCLES)]
-        valu_bundles = [[] for _ in range(MAX_CYCLES)]
-        alu_bundles = [[] for _ in range(MAX_CYCLES)]
-        # cycle 0: load 0, 7
-        load_bundles[0].extend([num_loads["0"], num_loads["7"]])
-        # cycle 1: vload init vars, s_vlen; vbroadcast 7
-        load_bundles[1].extend([init_vars_vload, vlen_loads["s_vlen"]])
-        valu_bundles[1].extend([num_vbroadcasts[vector("7")]])
-        # cycle 2: vload treevals 0-7, load 1; alu 7 = forest_values + s_vlen
-        load_bundles[2].extend([treevals0_vload, num_loads["1"]])
-        alu_bundles[2].extend([treeval8_addr_calc])
-        # cycle 3: vload treevals 8-15, load 2; vbroadcast treevals 0 to 5
-        load_bundles[3].extend([treevals8_vload, num_loads["2"]])
-        valu_bundles[3].extend(
-            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(6)]
-        )
-        alu_bundles[3].extend([treeval16_addr_calc])
-        # cycle 4: vload treevals 16-23, load hashval0; vbroadcast treevals 6 to 11
-        load_bundles[4].extend([treevals16_vload] + [hash_add_loads["hash_add0"]])
-        valu_bundles[4].extend(
-            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(6, 12)]
-        )
-        alu_bundles[4].extend([treeval24_addr_calc])
-        # cycle 5: vload treevals 24-31, load hashval1; vbroadcast treevals 12 to 17
-        load_bundles[5].extend([treevals24_vload] + [hash_add_loads["hash_add1"]])
-        valu_bundles[5].extend(
-            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(12, 18)]
-        )
-        # cycle 6: load hashval 2, 3; vbroadcast treevals 18 to 23
-        load_bundles[6].extend([hash_add_loads[f"hash_add{i}"] for i in range(2, 4)])
-        valu_bundles[6].extend(
-            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(18, 24)]
-        )
-        # cycle 7: load hashval 4, 5; vbroadcast treevals 24 to 29
-        load_bundles[7].extend([hash_add_loads[f"hash_add{i}"] for i in range(4, 6)])
-        valu_bundles[7].extend(
-            [treeval_vbroadcasts[vector(f"treeval{i}")] for i in range(24, 30)]
-        )
-        # cycle 8: load hashval 0, 1; vbroadcast treeval30, 1, 2 and valu diff21, 43, 65
-        load_bundles[8].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2)])
-        valu_bundles[8].extend(
-            [treeval_vbroadcasts[vector("treeval30")]]
-            + [num_vbroadcasts[vector(f"{i}")] for i in range(1, 3)]
-            + [vdiff_valus[vector(f"diff{i + 1}{i}")] for i in range(1, 6, 2)]  # 1 3 5
-        )
-        # cycle 9: load hashval 2, 3; valu diff87, 109, 1211, 1413, vbroadcast forest_values_p
-        load_bundles[9].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(2, 4)])
-        valu_bundles[9].extend(
-            [
-                vdiff_valus[vector(f"diff{i + 1}{i}")] for i in range(7, 14, 2)
-            ]  # 7 9 11 13
-            + [forest_vals_vbroadcasts[vector("forest_values_p")]]
-        )
-        # cycle 10: load hashval 4, 5; vbroadcast hash_add 0-5
-        load_bundles[10].extend([hash_mult_loads[f"hash_mult{i}"] for i in range(4, 6)])
-        valu_bundles[10].extend(
-            [hash_add_vbroadcasts[vector(f"hash_add{i}")] for i in range(6)]
-        )
-        # cycle 11: load 3, 4; vbroadcast hash_mult 0-5
-        load_bundles[11].extend([num_loads["3"], num_loads["4"]])
-        valu_bundles[11].extend(
-            [hash_mult_vbroadcasts[vector(f"hash_mult{i}")] for i in range(6)]
-        )
-        # cycle 12: load 15, vbroadcast 3
-        load_bundles[12].extend([num_loads["15"]])
-        valu_bundles[12].extend([num_vbroadcasts[vector("3")]])
-        # cycle 13: vbroadcast 15
-        valu_bundles[13].extend([num_vbroadcasts[vector("15")]])
-
-        setup_cycle_count = 0
-        for load_bundle, valu_bundle, alu_bundle in zip(
-            load_bundles, valu_bundles, alu_bundles
-        ):
-            if load_bundle or valu_bundle:
-                self.add_bundle(load=load_bundle, valu=valu_bundle, alu=alu_bundle)
-                setup_cycle_count += 1
-        return const_mapping, scalar_return, vector_return
-
     # Make scratch registers. Modifies scratch allocator but does not issue instructions.
-    def make_freelists(self, scalar_return, vector_return):
-        scratch_left = SCRATCH_SIZE - self.scratch_ptr
-        # TODO tune this? each batch is now not limited to 3 scalar registers
-        N_SCALAR_REG = 32 * 2
-        num_extra_scalar = N_SCALAR_REG - len(scalar_return)
-        # take the rest for vector regs
-        num_vector_alloc = (scratch_left - num_extra_scalar) // VLEN
-
-        # Make the freelist. Vector and scalar are separated; TODO can we dynamically promote scalars to vectors?
-        scalar_freelist = set(self.alloc_scratch() for _ in range(num_extra_scalar))
-        scalar_freelist |= scalar_return
+    def make_freelists(self, n_scalar_reg: int):
+        assert self.scratch_ptr == 0
+        # Just do this statically.
+        scalar_freelist = set(self.alloc_scratch() for _ in range(n_scalar_reg))
+        N_VECTOR_REG = (SCRATCH_SIZE - n_scalar_reg) // VLEN
         vector_freelist = set(
-            self.alloc_scratch(length=VLEN) for _ in range(num_vector_alloc)
-        )
-        vector_freelist |= vector_return
-        return scalar_freelist, vector_freelist
-
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
-        # makes constant mappings, as well as instructions for setup phase
-        # this is only 12 cycles; simpler to just have it fully separate. not much overhead
-        consts, scalar_return, vector_return = self.build_const_mapping()
-
-        # make register freelists. this is free (no cycles)
-        scalar_freelist, vector_freelist = self.make_freelists(
-            scalar_return, vector_return
-        )
-        print(
-            f"{len(scalar_freelist)} scalar registers, {len(vector_freelist)} vector registers"
+            self.alloc_scratch(length=VLEN) for _ in range(N_VECTOR_REG)
         )
         assert all(reg < 1536 for reg in scalar_freelist), (
             "scalar register is out of bounds"
@@ -2332,8 +1843,20 @@ class KernelBuilder:
         assert all(reg < 1536 for reg in vector_freelist), (
             "vector register is out of bounds"
         )
+        print(
+            f"{len(scalar_freelist)} scalar registers, {len(vector_freelist)} vector registers"
+        )
+        return scalar_freelist, vector_freelist
+
+    def build_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        N_SCALAR_REG = 64
+        scalar_freelist, vector_freelist = self.make_freelists(N_SCALAR_REG)
+
         # required to match with reference
         self.add("flow", ("pause",))
+        # make_kernel_graph should contain the const code within itself.
         self.instrs.extend(
             make_kernel_graph(
                 forest_height,
@@ -2341,8 +1864,7 @@ class KernelBuilder:
                 rounds,
                 scalar_freelist,
                 vector_freelist,
-                consts,
-            ).generate_code_optimal(time_limit=60 * 60)
+            ).generate_code()
         )
 
         # Required to match with the yield in reference_kernel2

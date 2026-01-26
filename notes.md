@@ -538,3 +538,18 @@ what if:
 batch0, 123 -> batch8, 123 -> batch16, 123 -> batch24, 123...
 round3 for batch0 needs to be over before batch8 can start its thing
 dep. edge between batch0, round3 vout --> batch8, round1 vin
+
+## register usage
+
+- Notice: when a partial register (one lane of a vector) is on the RHS, dependency tracking works fine!
+- That variable will be freed when we're done, with no issue.
+- The issue is when the destination is a partial register. Then we need a vmerge op.
+- So let's actually define constants with the ISA, and then run dead code elim before generating code. This will get rid of constants we don't use.
+- What if we vbroadcast the tree values we need on the fly? Then we free up a *lot* of registers!
+- Some other things:
+  - We should always be able to pass in, as **argument**, a tuple of (str, int) where str is a vector variable and int is 0-7 (an offset). This generalizes valu_scalar.
+- We should also just get rid of dynamic register offloading, and instead just put it statically in our program. For example, we can just offload all the binary ops (^ in hash, for example) and iterate if we aren't driving enough throughput.
+- if `dst` is a tuple, we only allocate the associated string if not already in `using`?
+  - what implications does this have for refcounting?
+  - let's find out
+  - or maybe we should create a temp binding?

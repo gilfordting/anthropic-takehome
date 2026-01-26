@@ -553,3 +553,19 @@ dep. edge between batch0, round3 vout --> batch8, round1 vin
   - what implications does this have for refcounting?
   - let's find out
   - or maybe we should create a temp binding?
+- should we vbroadcast on the fly?
+  - this will be important if we want to free up more registers
+  - currently 1/3rd of the register file is just constants; this limits concurrency
+  - if we do, probably makes more sense to do it for the treevals
+  - there are only 12 hash constants
+  - but potentially 32 vector constants
+  - we should add something to check how many constants are in use before we start real work?
+- note that offset vregs only show up in a few places:
+  - scalar loading: load offset vreg <- offset vreg, vmerge after
+  - scalarizing valu: alu offset vreg <- offset vregs, vmerge after
+  - in constant defs, for scalar address calcs and vbroadcasts
+- if we scalarize some of the hash operations, we can grab back a few more registers from constants
+
+---- below here is real stuff -----
+
+## reasoning about cycles

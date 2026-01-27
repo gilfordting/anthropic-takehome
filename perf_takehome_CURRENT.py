@@ -42,1315 +42,6 @@ from problem import (
 Engine = Literal["alu", "valu", "load", "store", "flow", "debug", "NO-OP"]
 
 
-class FullComputationGraph:
-    def __init__(
-        self,
-        graph: nx.DiGraph,
-        scalar_freelist: set[int],
-        vector_freelist: set[int],
-        consts: dict[str, int],
-    ):
-        self.graph = graph
-        self.using = {}
-        self.scalar_freelist = scalar_freelist
-        self.vector_freelist = vector_freelist
-        self.consts = consts
-        self.refcounts = defaultdict(int)
-        self.distance_to_notable = {}
-        self.longest_dep_chain = {}
-        self.__post_init__()
-
-    def __post_init__(self):
-        assert all(
-            self.graph.in_degree(node) + self.graph.out_degree(node) > 0
-            for node in self.graph.nodes
-        )
-        self.prune_noops()
-        self.populate_heuristics()
-
-    def populate_heuristics(self):
-        self.distance_to_notable = {}
-        self.longest_dep_chain = {}
-        for node in reversed(list(nx.topological_sort(self.graph))):
-            self.longest_dep_chain[node] = (
-                max(
-                    (
-                        self.longest_dep_chain[succ]
-                        for succ in self.graph.successors(node)
-                    ),
-                    default=0,
-                )
-                + 1
-            )
-            if node.is_notable:
-                self.distance_to_notable[node] = 0
-            else:
-                self.distance_to_notable[node] = (
-                    min(
-                        (
-                            self.distance_to_notable[succ]
-                            for succ in self.graph.successors(node)
-                        ),
-                        default=100,
-                    )
-                    + 1
-                )
-
-    def get_leaves(self) -> list[SymbolicInstructionSlot]:
-        return [node for node in self.graph.nodes if self.graph.in_degree(node) == 0]
-
-    def get_stores(self) -> list[SymbolicInstructionSlot]:
-        return [node for node in self.graph.nodes if node.engine == "store"]
-
-    def prune_noops(self):
-        leaves = self.get_leaves()
-        for leaf in leaves:
-            if leaf.engine == "NO-OP":
-                assert leaf.op == "vmerge"
-                # Do the same reftracking stuff -- which slots depend on this one?
-                n_forward_deps = self.graph.out_degree(leaf)
-                assert n_forward_deps > 0
-                assert leaf.dest not in self.refcounts
-                self.refcounts[leaf.dest] = n_forward_deps
-                self.graph.remove_node(leaf)
-
-    @property
-    def has_more_work(self) -> bool:
-        return self.graph.number_of_nodes() > 0
-
-    # Allocate output reg. If partial, allocate only once.
-    def alloc_outreg(self, name: str) -> int:
-        if is_partial(name):
-            name = get_partial_vname(name)
-            if name in self.using:
-                return self.using[name]
-            reg = self.vector_freelist.pop()
-            self.using[name] = reg
-            return reg
-        if is_vector(name):
-            if len(self.vector_freelist) == 0:
-                print("using:", self.using)
-            reg = self.vector_freelist.pop()
-            self.using[name] = reg
-            return reg
-        assert is_scalar(name)
-        reg = self.scalar_freelist.pop()
-        self.using[name] = reg
-        return reg
-
-    # Frees the register associated with a given variable name.
-    def free_outreg(self, name: str):
-        # We can't free partial registers; this is fine because the vmerge noop pruning will free the register for us.
-        # The underlying vector register gets allocated when the first vload_scalar is scheduled.
-        # Then vmerge will define the same variable as the partial vars, and everything works!
-        if is_partial(name):
-            assert get_partial_vname(name) in self.using
-            return
-        assert name in self.using
-        if is_vector(name):
-            self.vector_freelist.add(self.using.pop(name))
-            return
-        assert is_scalar(name)
-        self.scalar_freelist.add(self.using.pop(name))
-
-    def schedule(self) -> Instruction:
-        self.prune_noops()
-        assert self.has_more_work
-        bundle = defaultdict(list)
-        seen_dests = set()
-
-        def can_schedule(leaf: SymbolicInstructionSlot) -> bool:
-            if leaf.engine == "alu":
-                return len(bundle["alu"]) < SLOT_LIMITS["alu"]
-            if leaf.engine == "valu":
-                return len(bundle["valu"]) < SLOT_LIMITS["valu"]
-            if leaf.engine == "load":
-                return len(bundle["load"]) < SLOT_LIMITS["load"]
-            if leaf.engine == "store":
-                return len(bundle["store"]) < SLOT_LIMITS["store"]
-            if leaf.engine == "flow":
-                return len(bundle["flow"]) < SLOT_LIMITS["flow"]
-            if leaf.engine == "debug":
-                return len(bundle["debug"]) < SLOT_LIMITS["debug"]
-            return False
-
-        leaves = self.get_leaves()
-        # Sort leaves by longest dependency chain, so we can schedule the ones that are closest to a notable node first. This will hopefully improve load utilization.
-        # Also, lower distance to notable is better. So subtract it.
-        leaves.sort(
-            key=lambda x: -self.distance_to_notable[x],
-            reverse=True,
-        )
-        # TODO: prioritize valu leaves first. Then we'll naturally have like fill valus -> offload full -> offload half -> schedule ALUs?????
-        one_full_offload = False
-        one_half_offload = False
-        for leaf in leaves:
-            alu_offload = False
-            alu_half_offload = False
-            if not can_schedule(leaf):
-                if (
-                    leaf.engine == "valu"
-                    and len(bundle["valu"]) == SLOT_LIMITS["valu"]
-                    and leaf.op not in ("multiply_add", "vbroadcast")
-                ):
-                    if len(bundle["alu"]) < SLOT_LIMITS["alu"] - 8:
-                        # we can offload to alu!
-                        alu_offload = True
-                        one_full_offload = True
-                    else:
-                        # If we've already done a full offload, we could still offload half of this one.
-                        # But we should only do this once per scheduling round.
-                        if one_full_offload:
-                            if not one_half_offload:
-                                alu_half_offload = True
-                                one_half_offload = True
-                            else:
-                                continue
-                        else:
-                            continue
-                else:
-                    continue
-
-            if alu_half_offload:
-                # If half offload, we need to turn this slot into 8 slots + 1 vmerge noop.
-                # We'll just modify the graph in place, and move on. Next round will handle it.
-                op = leaf.op
-                a1, a2 = leaf.arg_names
-                partials = [make_partial(leaf.dest, i) for i in range(8)]
-                partial_leaves = [
-                    make_slot("valu_scalar", [op, a1, a2, i], dest=dest)
-                    for i, dest in enumerate(partials)
-                ]
-                vmerge_noop = make_slot("vmerge", partials, dest=leaf.dest)
-                # first, add vmerge to the graph. give it the same forward deps as the original leaf, and the same heuristic scores
-                self.graph.add_node(vmerge_noop)
-                for succ in self.graph.successors(leaf):
-                    self.graph.add_edge(vmerge_noop, succ, var=leaf.dest)
-                self.distance_to_notable[vmerge_noop] = self.distance_to_notable[leaf]
-                self.longest_dep_chain[vmerge_noop] = self.longest_dep_chain[leaf]
-                # we can safely remove original node now
-                self.graph.remove_node(leaf)
-                # then, add partials to the graph
-                for partial_leaf in partial_leaves:
-                    self.graph.add_node(partial_leaf)
-                    self.graph.add_edge(
-                        partial_leaf, vmerge_noop, var=partial_leaf.dest
-                    )
-                    # the only forward dep is vmerge noop, so update scores accordingly
-                    self.distance_to_notable[partial_leaf] = (
-                        self.distance_to_notable[vmerge_noop] + 1
-                    )
-                    self.longest_dep_chain[partial_leaf] = (
-                        self.longest_dep_chain[vmerge_noop] + 1
-                    )
-                # Also dependency tracking.
-                for arg in leaf.dependencies:
-                    # the dependency has gone from 1 to 8
-                    # so we need to update the dependency tracking
-                    self.refcounts[arg] += 7
-                continue
-
-            # Allocate output register and concrete-ize the slot
-            out_reg = None
-            # If we have multiple things defining the same variable, something is wrong
-            if leaf.dest is not None:
-                assert leaf.dest not in seen_dests
-                seen_dests.add(leaf.dest)
-                out_reg = self.alloc_outreg(leaf.dest)
-
-            # Main logic
-            if alu_offload:
-                insts = leaf.to_concrete_alu_offload(
-                    self.using, self.consts, out_reg=out_reg
-                )
-                bundle["alu"].extend(insts)
-            # elif alu_half_offload:
-            #     # If half offload, we need to turn this slot into 8 slots + 1 vmerge noop.
-
-            #     insts = leaf.to_concrete_alu_offload(
-            #         self.using, self.consts, out_reg=out_reg
-            #     )
-            #     bundle["alu"].extend(insts)
-            else:
-                engine, inst = leaf.to_concrete(
-                    self.using, self.consts, out_reg=out_reg
-                )
-                assert engine != "NO-OP"
-                bundle[engine].append(inst)
-
-            # Reftracking: what slots depend on this one?
-            n_forward_deps = 0
-            for _, _, var_name in self.graph.out_edges(leaf, data=True):
-                if var_name == "FAKE":
-                    continue
-                n_forward_deps += 1
-
-            if leaf.dest is not None and n_forward_deps > 0:
-                assert leaf.dest not in self.refcounts, (
-                    f"leaf.dest {leaf.dest} already in refcounts, from leaf {leaf}"
-                )
-                self.refcounts[leaf.dest] = n_forward_deps
-
-            # Remove this leaf, expose more work/leaves
-            self.graph.remove_node(leaf)
-
-            # # We can also free registers from our arguments, if refcount reaches 0
-            for arg in leaf.dependencies:
-                self.refcounts[arg] -= 1
-                if self.refcounts[arg] == 0:
-                    reg = self.using.pop(arg)
-                    if is_vector(arg):
-                        self.vector_freelist.add(reg)
-                    else:
-                        self.scalar_freelist.add(reg)
-
-        return bundle
-
-    def generate_code(self):
-        code = []
-        orig_sfreelist_len = len(self.scalar_freelist)
-        orig_vfreelist_len = len(self.vector_freelist)
-        while self.has_more_work:
-            bundle = self.schedule()
-            code.append(bundle)
-        assert len(self.scalar_freelist) == orig_sfreelist_len
-        assert len(self.vector_freelist) == orig_vfreelist_len
-        return code
-
-
-def make_hash_graph(
-    batch: int, round: int, in_name: str, out_name: str
-) -> ComputationGraph:
-    def vlocalize(name: str, hash_round: int) -> str:
-        return vector(f"{localize(name, batch, round)}_hashround{hash_round}")
-
-    graph = ComputationGraph()
-
-    curr_in_name = in_name
-    for i, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
-        # Convert to valu operations
-        op1, op2, op3 = (f"valu{op}" for op in (op1, op2, op3))
-        # Make this round's output variable
-        curr_out_name = vlocalize("out", i)
-
-        if i in (0, 2, 4):
-            args = [curr_in_name, vconst(f"hash_mult{i}"), vconst(f"hash_add{i}")]
-            graph.add_new_slot(
-                "multiply_add",
-                args,
-                dest=curr_out_name,
-            )
-        else:
-            last_stage = i == len(HASH_STAGES) - 1
-            tmp1 = vlocalize("tmp1", i)
-            tmp2 = vlocalize("tmp2", i)
-            graph.add_new_slot(op1, [curr_in_name, vconst(f"hash_add{i}")], dest=tmp1)
-            graph.add_new_slot(op3, [curr_in_name, vconst(f"hash_mult{i}")], dest=tmp2)
-            graph.add_new_slot(
-                op2,
-                [tmp1, tmp2],
-                dest=out_name if last_stage else curr_out_name,
-                exports=last_stage,
-            )
-        curr_in_name = curr_out_name
-
-    assert len(graph.ext_deps) == 1 and in_name in graph.ext_deps
-    assert len(graph.exports) == 1 and out_name in graph.exports
-    return graph
-
-
-def make_round0_graph(
-    batch: int, round, val_in: str, val_out: str, idx_out: str, treeval_out: str
-) -> ComputationGraph:
-    def vlocalize_r0(name: str) -> str:
-        return vlocalize(
-            name,
-            batch,
-            round,
-        )
-
-    graph = ComputationGraph()
-    hash_in = vlocalize_r0("hash_in")
-    parity = vlocalize_r0("parity")
-    graph.add_new_slot("valu^", [val_in, vconst("treeval0")], dest=hash_in)
-    graph.merge_below(make_hash_graph(batch, round, hash_in, val_out))
-    graph.exports[val_out] = graph.inner_defs[val_out]
-    graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
-    graph.add_new_slot("valu+", [parity, vconstn(1)], dest=idx_out, exports=True)
-    graph.add_new_slot(
-        "multiply_add",
-        [parity, vconst("diff21"), vconst("treeval1")],
-        dest=treeval_out,
-        exports=True,
-    )
-
-    assert len(graph.ext_deps) == 1 and val_in in graph.ext_deps
-    assert len(graph.exports) == 3 and all(
-        name in graph.exports for name in (val_out, idx_out, treeval_out)
-    ), f"exports {graph.exports} do not match (val_out, idx_out, treeval_out)"
-    return graph
-
-
-def make_round1_graph_alu(
-    batch: int,
-    round: int,
-    val_in: str,
-    val_out: str,
-    idx_in: str,
-    idx_out: str,
-    treeval_in: str,
-    treeval_out: str,
-):
-    def vlocalize_r1(name: str) -> str:
-        return vlocalize(
-            name,
-            batch,
-            round,
-        )
-
-    hash_in = vlocalize_r1("hash_in")
-    idx_tmp = vlocalize_r1("idx_tmp")
-    parity = vlocalize_r1("parity")
-    norm_idx = vlocalize_r1("norm_idx")
-    norm_idx_down1 = vlocalize_r1("norm_idx_down1")
-    bit0 = vlocalize_r1("bit0")
-    bit1 = vlocalize_r1("bit1")
-    lerp43 = vlocalize_r1("lerp43")
-    lerp65 = vlocalize_r1("lerp65")
-    ddiff6543 = vlocalize_r1("ddiff6543")
-
-    graph = ComputationGraph()
-    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
-    graph.merge_below(make_hash_graph(batch, round, hash_in, val_out))
-    graph.exports[val_out] = graph.inner_defs[val_out]
-    graph.add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_tmp)
-    graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
-    graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
-    graph.add_new_slot("valu-", [idx_out, vconstn(3)], dest=norm_idx)
-    graph.add_new_slot("valu&", [norm_idx, vconstn(1)], dest=bit0)
-    graph.add_new_slot("valu>>", [norm_idx, vconstn(1)], dest=norm_idx_down1)
-    graph.add_new_slot("valu&", [norm_idx_down1, vconstn(1)], dest=bit1)
-    graph.add_new_slot(
-        "multiply_add", [bit0, vconst("diff43"), vconst("treeval3")], dest=lerp43
-    )
-    graph.add_new_slot(
-        "multiply_add", [bit0, vconst("diff65"), vconst("treeval5")], dest=lerp65
-    )
-    graph.add_new_slot("valu-", [lerp65, lerp43], dest=ddiff6543)
-    graph.add_new_slot(
-        "multiply_add", [bit1, ddiff6543, lerp43], dest=treeval_out, exports=True
-    )
-
-    assert len(graph.ext_deps) == 3 and all(
-        name in graph.ext_deps for name in (val_in, idx_in, treeval_in)
-    )
-    assert len(graph.exports) == 3 and all(
-        name in graph.exports for name in (val_out, idx_out, treeval_out)
-    )
-    return graph
-
-
-def make_round1_graph_flow(
-    batch: int,
-    round: int,
-    val_in: str,
-    val_out: str,
-    idx_in: str,
-    idx_out: str,
-    treeval_in: str,
-    treeval_out: str,
-):
-    def vlocalize_r1(name: str) -> str:
-        return vlocalize(
-            name,
-            batch,
-            round,
-        )
-
-    hash_in = vlocalize_r1("hash_in")
-    idx_tmp = vlocalize_r1("idx_tmp")
-    parity = vlocalize_r1("parity")
-    norm_idx = vlocalize_r1("norm_idx")
-    norm_idx_down1 = vlocalize_r1("norm_idx_down1")
-    bit0 = vlocalize_r1("bit0")
-    bit1 = vlocalize_r1("bit1")
-    sel43 = vlocalize_r1("sel43")
-    sel65 = vlocalize_r1("sel65")
-
-    graph = ComputationGraph()
-    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
-    graph.merge_below(make_hash_graph(batch, round, hash_in, val_out))
-    graph.exports[val_out] = graph.inner_defs[val_out]
-    graph.add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_tmp)
-    graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
-    graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
-    graph.add_new_slot("valu-", [idx_out, vconstn(3)], dest=norm_idx)
-    graph.add_new_slot("valu&", [norm_idx, vconstn(1)], dest=bit0)
-    graph.add_new_slot("valu>>", [norm_idx, vconstn(1)], dest=norm_idx_down1)
-    graph.add_new_slot("valu&", [norm_idx_down1, vconstn(1)], dest=bit1)
-    graph.add_new_slot(
-        "vselect", [bit0, vconst("treeval4"), vconst("treeval3")], dest=sel43
-    )
-    graph.add_new_slot(
-        "vselect", [bit0, vconst("treeval6"), vconst("treeval5")], dest=sel65
-    )
-    graph.add_new_slot("vselect", [bit1, sel65, sel43], dest=treeval_out, exports=True)
-
-    assert len(graph.ext_deps) == 3 and all(
-        name in graph.ext_deps for name in (val_in, idx_in, treeval_in)
-    )
-    assert len(graph.exports) == 3 and all(
-        name in graph.exports for name in (val_out, idx_out, treeval_out)
-    )
-    return graph
-
-
-def make_round1_graph(
-    batch: int,
-    round: int,
-    val_in: str,
-    val_out: str,
-    idx_in: str,
-    idx_out: str,
-    treeval_in: str,
-    treeval_out: str,
-    use_flow=False,
-):
-    if use_flow:
-        return make_round1_graph_flow(
-            batch, round, val_in, val_out, idx_in, idx_out, treeval_in, treeval_out
-        )
-    return make_round1_graph_alu(
-        batch, round, val_in, val_out, idx_in, idx_out, treeval_in, treeval_out
-    )
-
-
-def make_round2_graph_alu(
-    batch: int,
-    round: int,
-    val_in: str,
-    val_out: str,
-    idx_in: str,
-    idx_out: str,
-    treeval_in: str,
-    treeval_out: str,
-):
-    def vlocalize_r2(name: str) -> str:
-        return vlocalize(
-            name,
-            batch,
-            round,
-        )
-
-    hash_in = vlocalize_r2("hash_in")
-    idx_tmp = vlocalize_r2("idx_tmp")
-    parity = vlocalize_r2("parity")
-    norm_idx = vlocalize_r2("norm_idx")
-    norm_idx_down1 = vlocalize_r2("norm_idx_down1")
-    norm_idx_down2 = vlocalize_r2("norm_idx_down2")
-    bit0 = vlocalize_r2("bit0")
-    bit1 = vlocalize_r2("bit1")
-    bit2 = vlocalize_r2("bit2")
-    lerp87 = vlocalize_r2("lerp87")
-    lerp109 = vlocalize_r2("lerp109")
-    lerp1211 = vlocalize_r2("lerp1211")
-    lerp1413 = vlocalize_r2("lerp1413")
-    ddiff10987 = vlocalize_r2("ddiff10987")
-    ddiff14131211 = vlocalize_r2("ddiff14131211")
-    lerp10987 = vlocalize_r2("lerp10987")
-    lerp14131211 = vlocalize_r2("lerp14131211")
-    dddiff147 = vlocalize_r2("dddiff147")
-
-    graph = ComputationGraph()
-    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
-
-    graph.merge_below(make_hash_graph(batch, round, hash_in, val_out))
-    graph.exports[val_out] = graph.inner_defs[val_out]
-
-    graph.add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_tmp)
-    graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
-    graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
-    graph.add_new_slot("valu-", [idx_out, vconstn(7)], dest=norm_idx)
-    graph.add_new_slot("valu>>", [norm_idx, vconstn(1)], dest=norm_idx_down1)
-    graph.add_new_slot("valu>>", [norm_idx, vconstn(2)], dest=norm_idx_down2)
-    graph.add_new_slot("valu&", [norm_idx, vconstn(1)], dest=bit0)
-    graph.add_new_slot("valu&", [norm_idx_down1, vconstn(1)], dest=bit1)
-    graph.add_new_slot("valu&", [norm_idx_down2, vconstn(1)], dest=bit2)
-
-    graph.add_new_slot(
-        "multiply_add", [bit0, vconst("diff87"), vconst("treeval7")], dest=lerp87
-    )
-    graph.add_new_slot(
-        "multiply_add", [bit0, vconst("diff109"), vconst("treeval9")], dest=lerp109
-    )
-    graph.add_new_slot(
-        "multiply_add", [bit0, vconst("diff1211"), vconst("treeval11")], dest=lerp1211
-    )
-    graph.add_new_slot(
-        "multiply_add", [bit0, vconst("diff1413"), vconst("treeval13")], dest=lerp1413
-    )
-
-    graph.add_new_slot("valu-", [lerp109, lerp87], dest=ddiff10987)
-    graph.add_new_slot("valu-", [lerp1413, lerp1211], dest=ddiff14131211)
-
-    graph.add_new_slot("multiply_add", [bit1, ddiff10987, lerp87], dest=lerp10987)
-    graph.add_new_slot(
-        "multiply_add", [bit1, ddiff14131211, lerp1211], dest=lerp14131211
-    )
-    graph.add_new_slot("valu-", [lerp14131211, lerp10987], dest=dddiff147)
-
-    graph.add_new_slot(
-        "multiply_add", [bit2, dddiff147, lerp10987], dest=treeval_out, exports=True
-    )
-
-    assert len(graph.ext_deps) == 3 and all(
-        name in graph.ext_deps for name in (val_in, idx_in, treeval_in)
-    )
-    assert len(graph.exports) == 3 and all(
-        name in graph.exports for name in (val_out, idx_out, treeval_out)
-    )
-    return graph
-
-
-def make_round2_graph_flow(
-    batch: int,
-    round: int,
-    val_in: str,
-    val_out: str,
-    idx_in: str,
-    idx_out: str,
-    treeval_in: str,
-    treeval_out: str,
-):
-    def vlocalize_r2(name: str) -> str:
-        return vlocalize(
-            name,
-            batch,
-            round,
-        )
-
-    hash_in = vlocalize_r2("hash_in")
-    idx_tmp = vlocalize_r2("idx_tmp")
-    parity = vlocalize_r2("parity")
-    norm_idx = vlocalize_r2("norm_idx")
-    norm_idx_down1 = vlocalize_r2("norm_idx_down1")
-    norm_idx_down2 = vlocalize_r2("norm_idx_down2")
-    bit0 = vlocalize_r2("bit0")
-    bit1 = vlocalize_r2("bit1")
-    bit2 = vlocalize_r2("bit2")
-    sel87 = vlocalize_r2("sel87")
-    sel109 = vlocalize_r2("sel109")
-    sel1211 = vlocalize_r2("sel1211")
-    sel1413 = vlocalize_r2("sel1413")
-    sel10987 = vlocalize_r2("sel10987")
-    sel14131211 = vlocalize_r2("sel14131211")
-
-    graph = ComputationGraph()
-    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
-
-    graph.merge_below(make_hash_graph(batch, round, hash_in, val_out))
-    graph.exports[val_out] = graph.inner_defs[val_out]
-
-    graph.add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_tmp)
-    graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
-    graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
-    graph.add_new_slot("valu-", [idx_out, vconstn(7)], dest=norm_idx)
-    graph.add_new_slot("valu>>", [norm_idx, vconstn(1)], dest=norm_idx_down1)
-    graph.add_new_slot("valu>>", [norm_idx, vconstn(2)], dest=norm_idx_down2)
-    graph.add_new_slot("valu&", [norm_idx, vconstn(1)], dest=bit0)
-    graph.add_new_slot("valu&", [norm_idx_down1, vconstn(1)], dest=bit1)
-    graph.add_new_slot("valu&", [norm_idx_down2, vconstn(1)], dest=bit2)
-
-    sel87_slot = make_slot(
-        "vselect", [bit0, vconst("treeval8"), vconst("treeval7")], dest=sel87
-    )
-    sel109_slot = make_slot(
-        "vselect", [bit0, vconst("treeval10"), vconst("treeval9")], dest=sel109
-    )
-    sel1211_slot = make_slot(
-        "vselect", [bit0, vconst("treeval12"), vconst("treeval11")], dest=sel1211
-    )
-    sel1413_slot = make_slot(
-        "vselect", [bit0, vconst("treeval14"), vconst("treeval13")], dest=sel1413
-    )
-    sel10987_slot = make_slot("vselect", [bit1, sel109, sel87], dest=sel10987)
-    sel14131211_slot = make_slot("vselect", [bit1, sel1413, sel1211], dest=sel14131211)
-    treeval_out_slot = make_slot(
-        "vselect", [bit2, sel14131211, sel10987], dest=treeval_out
-    )
-
-    graph.add_slot(sel87_slot)
-    graph.add_slot(sel109_slot)
-    graph.add_slot(sel1211_slot)
-    graph.add_slot(sel1413_slot)
-    graph.add_slot(sel10987_slot)
-    graph.add_slot(sel14131211_slot)
-    graph.add_slot(treeval_out_slot, exports=True)
-
-    # for src in [sel87_slot, sel109_slot, sel1211_slot, sel1413_slot]:
-    #     for target in [sel10987_slot, sel14131211_slot]:
-    #         graph.add_edge(src, target, var="FAKE")
-
-    # graph.add_new_slot(
-    #     "vselect", [bit0, vconst("treeval8"), vconst("treeval7")], dest=sel87
-    # )
-    # graph.add_new_slot(
-    #     "vselect", [bit0, vconst("treeval10"), vconst("treeval9")], dest=sel109
-    # )
-    # graph.add_new_slot(
-    #     "vselect", [bit0, vconst("treeval12"), vconst("treeval11")], dest=sel1211
-    # )
-    # graph.add_new_slot(
-    #     "vselect", [bit0, vconst("treeval14"), vconst("treeval13")], dest=sel1413
-    # )
-
-    # graph.add_new_slot("vselect", [bit1, sel109, sel87], dest=sel10987)
-    # graph.add_new_slot("vselect", [bit1, sel1413, sel1211], dest=sel14131211)
-    # graph.add_new_slot(
-    #     "vselect", [bit2, sel14131211, sel10987], dest=treeval_out, exports=True
-    # )
-
-    assert len(graph.ext_deps) == 3 and all(
-        name in graph.ext_deps for name in (val_in, idx_in, treeval_in)
-    )
-    assert len(graph.exports) == 3 and all(
-        name in graph.exports for name in (val_out, idx_out, treeval_out)
-    )
-    return graph
-
-
-def make_round2_graph(
-    batch: int,
-    round: int,
-    val_in: str,
-    val_out: str,
-    idx_in: str,
-    idx_out: str,
-    treeval_in: str,
-    treeval_out: str,
-    use_flow=False,
-):
-    if use_flow:
-        return make_round2_graph_flow(
-            batch, round, val_in, val_out, idx_in, idx_out, treeval_in, treeval_out
-        )
-    return make_round2_graph_alu(
-        batch, round, val_in, val_out, idx_in, idx_out, treeval_in, treeval_out
-    )
-
-
-def make_round3_graph(
-    batch: int,
-    round: int,
-    val_in: str,
-    val_out: str,
-    idx_in: str,
-    idx_out: str,
-    treeval_in: str,
-    treeval_out: str,
-):
-    def vlocalize_r3(name: str) -> str:
-        return vlocalize(
-            name,
-            batch,
-            round,
-        )
-
-    hash_in = vlocalize_r3("hash_in")
-    idx_tmp = vlocalize_r3("idx_tmp")
-    parity = vlocalize_r3("parity")
-    norm_idx = vlocalize_r3("norm_idx")
-    norm_idx_down1 = vlocalize_r3("norm_idx_down1")
-    norm_idx_down2 = vlocalize_r3("norm_idx_down2")
-    norm_idx_down3 = vlocalize_r3("norm_idx_down3")
-    bit0 = vlocalize_r3("bit0")
-    bit1 = vlocalize_r3("bit1")
-    bit2 = vlocalize_r3("bit2")
-    bit3 = vlocalize_r3("bit3")
-    sel1615 = vlocalize_r3("sel1615")
-    sel1817 = vlocalize_r3("sel1817")
-    sel2019 = vlocalize_r3("sel2019")
-    sel2221 = vlocalize_r3("sel2221")
-    sel2423 = vlocalize_r3("sel2423")
-    sel2625 = vlocalize_r3("sel2625")
-    sel2827 = vlocalize_r3("sel2827")
-    sel3029 = vlocalize_r3("sel3029")
-    sel1815 = vlocalize_r3("sel1815")
-    sel2219 = vlocalize_r3("sel2219")
-    sel2623 = vlocalize_r3("sel2623")
-    sel3027 = vlocalize_r3("sel3027")
-    sel2215 = vlocalize_r3("sel2215")
-    sel3023 = vlocalize_r3("sel3023")
-
-    graph = ComputationGraph()
-    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
-
-    graph.merge_below(make_hash_graph(batch, round, hash_in, val_out))
-    graph.exports[val_out] = graph.inner_defs[val_out]
-
-    graph.add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_tmp)
-    graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
-    graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
-    graph.add_new_slot("valu-", [idx_out, vconstn(15)], dest=norm_idx)
-    graph.add_new_slot("valu>>", [norm_idx, vconstn(1)], dest=norm_idx_down1)
-    graph.add_new_slot("valu>>", [norm_idx, vconstn(2)], dest=norm_idx_down2)
-    graph.add_new_slot("valu>>", [norm_idx, vconstn(3)], dest=norm_idx_down3)
-    graph.add_new_slot("valu&", [norm_idx, vconstn(1)], dest=bit0)
-    graph.add_new_slot("valu&", [norm_idx_down1, vconstn(1)], dest=bit1)
-    graph.add_new_slot("valu&", [norm_idx_down2, vconstn(1)], dest=bit2)
-    graph.add_new_slot("valu&", [norm_idx_down3, vconstn(1)], dest=bit3)
-
-    graph.add_new_slot(
-        "vselect", [bit0, vconst("treeval16"), vconst("treeval15")], dest=sel1615
-    )
-    graph.add_new_slot(
-        "vselect", [bit0, vconst("treeval18"), vconst("treeval17")], dest=sel1817
-    )
-    graph.add_new_slot(
-        "vselect", [bit0, vconst("treeval20"), vconst("treeval19")], dest=sel2019
-    )
-    graph.add_new_slot(
-        "vselect", [bit0, vconst("treeval22"), vconst("treeval21")], dest=sel2221
-    )
-    graph.add_new_slot(
-        "vselect", [bit0, vconst("treeval24"), vconst("treeval23")], dest=sel2423
-    )
-    graph.add_new_slot(
-        "vselect", [bit0, vconst("treeval26"), vconst("treeval25")], dest=sel2625
-    )
-    graph.add_new_slot(
-        "vselect", [bit0, vconst("treeval28"), vconst("treeval27")], dest=sel2827
-    )
-    graph.add_new_slot(
-        "vselect", [bit0, vconst("treeval30"), vconst("treeval29")], dest=sel3029
-    )
-    graph.add_new_slot("vselect", [bit1, sel1817, sel1615], dest=sel1815)
-    graph.add_new_slot("vselect", [bit1, sel2221, sel2019], dest=sel2219)
-    graph.add_new_slot("vselect", [bit1, sel2625, sel2423], dest=sel2623)
-    graph.add_new_slot("vselect", [bit1, sel3029, sel2827], dest=sel3027)
-    graph.add_new_slot("vselect", [bit2, sel2219, sel1815], dest=sel2215)
-    graph.add_new_slot("vselect", [bit2, sel3027, sel2623], dest=sel3023)
-    graph.add_new_slot(
-        "vselect", [bit3, sel3023, sel2215], dest=treeval_out, exports=True
-    )
-
-    assert len(graph.ext_deps) == 3 and all(
-        name in graph.ext_deps for name in (val_in, idx_in, treeval_in)
-    )
-    assert len(graph.exports) == 3 and all(
-        name in graph.exports for name in (val_out, idx_out, treeval_out)
-    )
-    return graph
-
-
-# with this new system, idx_in and treeval_in for wraparound round should automatically be freed naturally? like they have less edges, so detected automatically
-def make_wraparound_graph(
-    batch: int,
-    round: int,
-    val_in: str,
-    treeval_in: str,
-    val_out: str,
-):
-    def vlocalize_wrap(name: str) -> str:
-        return vlocalize(name, batch, round)
-
-    graph = ComputationGraph()
-    hash_in = vlocalize_wrap("hash_in")
-
-    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
-    graph.merge_below(make_hash_graph(batch, "wrap", hash_in, val_out))
-    graph.exports[val_out] = graph.inner_defs[val_out]
-
-    assert len(graph.ext_deps) == 2 and all(
-        name in graph.ext_deps for name in (val_in, treeval_in)
-    )
-    assert len(graph.exports) == 1 and val_out in graph.exports
-    return graph
-
-
-def make_last_round_graph(
-    batch: int,
-    round: int,
-    val_in: str,
-    treeval_in: str,
-    curr_addr_in: str,
-):
-    def vlocalize_last(name: str) -> str:
-        return vlocalize(name, batch, round)
-
-    graph = ComputationGraph()
-    hash_in = vlocalize_last("hash_in")
-    val_final = vlocalize_last("val_final")
-
-    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
-    # no export this time
-    graph.merge_below(make_hash_graph(batch, round, hash_in, val_final))
-    graph.add_new_slot("vstore", [curr_addr_in, val_final])
-
-    assert len(graph.ext_deps) == 3 and all(
-        name in graph.ext_deps for name in (val_in, treeval_in, curr_addr_in)
-    )
-    assert len(graph.exports) == 0
-    return graph
-
-
-def make_mid_round_graph(
-    batch: int,
-    round: int,
-    val_in: str,
-    val_out: str,
-    idx_in: str,
-    idx_out: str,
-    treeval_in: str,
-    treeval_out: str,
-):
-    def vlocalize_rmid(name: str) -> str:
-        return vlocalize(name, batch, round)
-
-    def partial(vname, lane_numbers: str) -> str:
-        return make_partial(vname, lane_numbers)
-
-    hash_in = vlocalize_rmid("hash_in")
-    parity = vlocalize_rmid("parity")
-    idx_tmp = vlocalize_rmid("idx_tmp")
-    val_addrs = vlocalize_rmid("val_addrs")
-    # partials
-    partials = [partial(treeval_out, i) for i in range(8)]
-
-    graph = ComputationGraph()
-    graph.add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
-
-    graph.merge_below(make_hash_graph(batch, round, hash_in, val_out))
-    graph.exports[val_out] = graph.inner_defs[val_out]
-
-    graph.add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_tmp)
-    graph.add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
-    graph.add_new_slot("valu+", [idx_tmp, parity], dest=idx_out, exports=True)
-    graph.add_new_slot("valu+", [vconst("forest_values_p"), idx_out], dest=val_addrs)
-
-    for i, partial_var in enumerate(partials):
-        graph.add_new_slot("vload_scalar", [val_addrs, i], dest=partial_var)
-
-    graph.add_new_slot(
-        "vmerge",
-        partials,
-        dest=treeval_out,
-        exports=True,
-    )
-
-    assert len(graph.ext_deps) == 3 and all(
-        name in graph.ext_deps for name in (val_in, idx_in, treeval_in)
-    )
-    assert len(graph.exports) == 3 and all(
-        name in graph.exports for name in (val_out, idx_out, treeval_out)
-    )
-    return graph
-
-
-# shifts needed to make a number in [0, 32)
-def calculate_shifts(n: int) -> list[int]:
-    shift = 0
-    shifts = []
-    while n > 0:
-        if n % 2 == 1:
-            shifts.append(shift)
-        n //= 2
-        shift += 1
-    return shifts
-
-
-def make_init_load_graph(
-    batch: int, curr_addr_out: str, val_init_out: str
-) -> ComputationGraph:
-    graph = ComputationGraph()
-    assert batch % 8 == 0
-    batch_prime = batch // 8
-    assert batch_prime < 32
-
-    tmp_offset = [batch_localize(f"tmp_offset{i}", batch) for i in range(5)]
-    tmp_offset_sum = [batch_localize(f"tmp_offset_sum{i}", batch) for i in range(4)]
-    tmp_offset_final = batch_localize("tmp_offset_final", batch)
-
-    if batch_prime == 0:
-        graph.add_new_slot(
-            "+", [const("inp_values_p"), constn(0)], dest=curr_addr_out, exports=True
-        )
-        graph.add_new_slot(
-            "vload", [const("inp_values_p")], dest=val_init_out, exports=True
-        )
-    elif batch_prime == 1:
-        graph.add_new_slot(
-            "+",
-            [const("inp_values_p"), const("s_vlen")],
-            dest=curr_addr_out,
-            exports=True,
-        )
-        graph.add_new_slot("vload", [curr_addr_out], dest=val_init_out, exports=True)
-    else:
-        shifts = calculate_shifts(batch // VLEN)
-        if len(shifts) == 1:
-            # power of 2 shift
-            shift = shifts[0]
-            graph.add_new_slot("<<", [constn(1), constn(shift)], dest=tmp_offset[0])
-            graph.add_new_slot(
-                "*", [const("s_vlen"), tmp_offset[0]], dest=tmp_offset_final
-            )
-            graph.add_new_slot(
-                "+",
-                [const("inp_values_p"), tmp_offset_final],
-                dest=curr_addr_out,
-                exports=True,
-            )
-            graph.add_new_slot(
-                "vload", [curr_addr_out], dest=val_init_out, exports=True
-            )
-        else:
-            # shifts
-            for i, shift in enumerate(shifts):
-                graph.add_new_slot("<<", [constn(1), constn(shift)], dest=tmp_offset[i])
-            # sums -- this part is variable
-            if len(shifts) == 2:
-                graph.add_new_slot(
-                    "+", [tmp_offset[0], tmp_offset[1]], dest=tmp_offset_sum[0]
-                )
-                graph.add_new_slot(
-                    "*", [const("s_vlen"), tmp_offset_sum[0]], dest=tmp_offset_final
-                )
-            if len(shifts) == 3:
-                graph.add_new_slot(
-                    "+", [tmp_offset[0], tmp_offset[1]], dest=tmp_offset_sum[0]
-                )
-                graph.add_new_slot(
-                    "+", [tmp_offset_sum[0], tmp_offset[2]], dest=tmp_offset_sum[1]
-                )
-                graph.add_new_slot(
-                    "*", [const("s_vlen"), tmp_offset_sum[1]], dest=tmp_offset_final
-                )
-            elif len(shifts) == 4:
-                graph.add_new_slot(
-                    "+", [tmp_offset[0], tmp_offset[1]], dest=tmp_offset_sum[0]
-                )
-                graph.add_new_slot(
-                    "+", [tmp_offset[2], tmp_offset[3]], dest=tmp_offset_sum[1]
-                )
-                graph.add_new_slot(
-                    "+", [tmp_offset_sum[0], tmp_offset_sum[1]], dest=tmp_offset_sum[2]
-                )
-                graph.add_new_slot(
-                    "*", [const("s_vlen"), tmp_offset_sum[2]], dest=tmp_offset_final
-                )
-            elif len(shifts) == 5:
-                graph.add_new_slot(
-                    "+", [tmp_offset[0], tmp_offset[1]], dest=tmp_offset_sum[0]
-                )
-                graph.add_new_slot(
-                    "+", [tmp_offset[2], tmp_offset[3]], dest=tmp_offset_sum[1]
-                )
-                graph.add_new_slot(
-                    "+", [tmp_offset_sum[0], tmp_offset_sum[1]], dest=tmp_offset_sum[2]
-                )
-                graph.add_new_slot(
-                    "+", [tmp_offset_sum[2], tmp_offset[4]], dest=tmp_offset_sum[3]
-                )
-                graph.add_new_slot(
-                    "*", [const("s_vlen"), tmp_offset_sum[3]], dest=tmp_offset_final
-                )
-
-            # final addr calc and load
-            graph.add_new_slot(
-                "+",
-                [const("inp_values_p"), tmp_offset_final],
-                dest=curr_addr_out,
-                exports=True,
-            )
-            graph.add_new_slot(
-                "vload", [curr_addr_out], dest=val_init_out, exports=True
-            )
-
-    assert len(graph.ext_deps) == 0, f"ext deps {graph.ext_deps} do not match"
-    assert len(graph.exports) == 2 and all(
-        name in graph.exports for name in (curr_addr_out, val_init_out)
-    )
-    return graph
-
-
-def make_batch_graph(
-    forest_height: int,
-    rounds: int,
-    batch: int,
-) -> ComputationGraph:
-    curr_addr = batch_localize("curr_addr", batch)
-    # val, idx, treeval get diff names based on round
-    cgraph = ComputationGraph()
-    curr_addr = batch_localize("curr_addr", batch)
-    val_init = vbatch_localize("val_init", batch)
-    cgraph.merge_below(make_init_load_graph(batch, curr_addr, val_init))
-
-    # Only 4 batches can be in round 2 at any given moment? slot for treeval_in, slot for treeval_out for all of the round 2s
-    batch1_inout_slots = {}
-    batch2_inout_slots = {}
-    batch3_inout_slots = {}
-
-    for round in range(rounds):
-        # define output variables for this round; will be used as input for next round
-        val_out = vlocalize("val", batch, round)
-        idx_out = vlocalize("idx", batch, round)
-        treeval_out = vlocalize("treeval", batch, round)
-        # and the corresponding input vars:
-        val_in = vlocalize("val", batch, round - 1)
-        idx_in = vlocalize("idx", batch, round - 1)
-        treeval_in = vlocalize("treeval", batch, round - 1)
-
-        # round0 graphs
-        if round % (forest_height + 1) == 0:
-            val_in = val_init if round == 0 else val_in
-            cgraph.merge_below(
-                make_round0_graph(batch, round, val_in, val_out, idx_out, treeval_out)
-            )
-        # round1 graphs
-        elif round % (forest_height + 1) == 1:
-            cgraph.merge_below(
-                make_round1_graph(
-                    batch,
-                    round,
-                    val_in,
-                    val_out,
-                    idx_in,
-                    idx_out,
-                    treeval_in,
-                    treeval_out,
-                    use_flow=True,
-                )
-            )
-            batch1_inout_slots[round] = (
-                treeval_in,
-                treeval_out,
-                val_in,
-                val_out,
-                idx_in,
-                idx_out,
-            )
-        # round2 graphs
-        elif round % (forest_height + 1) == 2:
-            cgraph.merge_below(
-                make_round2_graph(
-                    batch,
-                    round,
-                    val_in,
-                    val_out,
-                    idx_in,
-                    idx_out,
-                    treeval_in,
-                    treeval_out,
-                    use_flow=True,
-                )
-            )
-            batch2_inout_slots[round] = (
-                treeval_in,
-                treeval_out,
-                val_in,
-                val_out,
-                idx_in,
-                idx_out,
-            )
-        # round3 graphs
-        elif round == 3:
-            cgraph.merge_below(
-                make_round3_graph(
-                    batch,
-                    round,
-                    val_in,
-                    val_out,
-                    idx_in,
-                    idx_out,
-                    treeval_in,
-                    treeval_out,
-                )
-            )
-            batch3_inout_slots[round] = (
-                treeval_in,
-                treeval_out,
-                val_in,
-                val_out,
-                idx_in,
-                idx_out,
-            )
-        # last round
-        elif round == rounds - 1:
-            cgraph.merge_below(
-                make_last_round_graph(batch, round, val_in, treeval_in, curr_addr)
-            )
-        # wraparound graph
-        elif (round + 1) % (forest_height + 1) == 0:
-            cgraph.merge_below(
-                make_wraparound_graph(batch, round, val_in, treeval_in, val_out)
-            )
-        else:
-            cgraph.merge_below(
-                make_mid_round_graph(
-                    batch,
-                    round,
-                    val_in,
-                    val_out,
-                    idx_in,
-                    idx_out,
-                    treeval_in,
-                    treeval_out,
-                )
-            )
-
-    assert len(cgraph.ext_deps) == 0
-    assert len(cgraph.exports) == 0
-    # find the corresponding slots
-    slots = {}
-    for node in cgraph.graph.nodes:
-        for round in (2, forest_height + 1 + 2):
-            treeval_in, treeval_out, val_in, val_out, idx_in, idx_out = (
-                batch2_inout_slots[round]
-            )
-            if node.dest == treeval_in:
-                slots[(round, "tin")] = node
-            elif node.dest == treeval_out:
-                slots[(round, "tout")] = node
-            elif node.dest == val_in:
-                slots[(round, "vin")] = node
-            elif node.dest == val_out:
-                slots[(round, "vout")] = node
-            elif node.dest == idx_in:
-                slots[(round, "iin")] = node
-            elif node.dest == idx_out:
-                slots[(round, "iout")] = node
-        for round in (1, forest_height + 1 + 1):
-            treeval_in, treeval_out, val_in, val_out, idx_in, idx_out = (
-                batch1_inout_slots[round]
-            )
-            if node.dest == treeval_in:
-                slots[(round, "tin")] = node
-            elif node.dest == treeval_out:
-                slots[(round, "tout")] = node
-            elif node.dest == val_in:
-                slots[(round, "vin")] = node
-            elif node.dest == val_out:
-                slots[(round, "vout")] = node
-            elif node.dest == idx_in:
-                slots[(round, "iin")] = node
-            elif node.dest == idx_out:
-                slots[(round, "iout")] = node
-        round = 3
-        treeval_in, treeval_out, val_in, val_out, idx_in, idx_out = batch3_inout_slots[
-            round
-        ]
-        if node.dest == treeval_in:
-            slots[(round, "tin")] = node
-        elif node.dest == treeval_out:
-            slots[(round, "tout")] = node
-        elif node.dest == val_in:
-            slots[(round, "vin")] = node
-        elif node.dest == val_out:
-            slots[(round, "vout")] = node
-        elif node.dest == idx_in:
-            slots[(round, "iin")] = node
-        elif node.dest == idx_out:
-            slots[(round, "iout")] = node
-
-    return cgraph, slots
-
-
-def make_all_batches_graph(
-    forest_height: int,
-    batch_size: int,
-    rounds: int,
-) -> nx.DiGraph:
-    comp_graphs = []
-    for batch in range(0, batch_size, VLEN):
-        comp_graphs.append(make_batch_graph(forest_height, rounds, batch))
-    nx_graphs = [g.graph for g, _ in comp_graphs]
-    graph = nx.union_all(nx_graphs)
-    batch_slots = [slots for _, slots in comp_graphs]
-    all_batch_slots = {}
-    for i, slots in enumerate(batch_slots):
-        batch = i * VLEN
-        for round, slot_type in slots:
-            all_batch_slots[(batch, round, slot_type)] = slots[(round, slot_type)]
-
-    # Now we need to add cross-batch edges between the graphs. This will allow us to limit the number of concurrent batches in each round.
-    def add_fake_dep(
-        from_node: SymbolicInstructionSlot,
-        to_node: SymbolicInstructionSlot,
-    ):
-        assert from_node in graph, f"originating node {from_node} must be in graph"
-        assert to_node in graph, f"destination node {to_node} must be in graph"
-        graph.add_edge(from_node, to_node, data="FAKE")
-
-    # serialize batch0 123, batch8 123, batch16 123, etc
-    for i in range(batch_size, VLEN):
-        if i - VLEN < 0:
-            continue
-        # dep. between previous vout and current vin
-        add_fake_dep(
-            all_batch_slots[(i, 3, "vout")], all_batch_slots[(i - VLEN, 1, "vin")]
-        )
-
-    # N_CONCURRENT_BATCHES = 4
-    # batches 0*VLEN, 1*VLEN, ..., (N_CONCURRENT_BATCHES-1)*VLEN can run at the same time
-    # then batch 4*VLEN depends on batch 0*VLEN, etc
-    # for i in range(batch_size // VLEN):
-    #     if i - N_CONCURRENT_BATCHES < 0:
-    #         continue
-    #     add_fake_dep(
-    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 2, "tout")],
-    #         all_batch_slots[(i * VLEN, 2, "tin")],
-    #     )
-    #     add_fake_dep(
-    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 2, "vout")],
-    #         all_batch_slots[(i * VLEN, 2, "vin")],
-    #     )
-    #     add_fake_dep(
-    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 2, "iout")],
-    #         all_batch_slots[(i * VLEN, 2, "iin")],
-    #     )
-    # for i in range(batch_size // VLEN):
-    #     if i - N_CONCURRENT_BATCHES < 0:
-    #         continue
-    #     add_fake_dep(
-    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 1, "tout")],
-    #         all_batch_slots[(i * VLEN, 1, "tin")],
-    #     )
-    #     add_fake_dep(
-    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 1, "vout")],
-    #         all_batch_slots[(i * VLEN, 1, "vin")],
-    #     )
-    #     add_fake_dep(
-    #         all_batch_slots[((i - N_CONCURRENT_BATCHES) * VLEN, 1, "iout")],
-    #         all_batch_slots[(i * VLEN, 1, "iin")],
-    #     )
-
-    return graph
-
-
-# This "compiles" the program
-def make_kernel_graph(
-    forest_height: int,
-    batch_size: int,
-    rounds: int,
-    scalar_freelist: set[int],
-    vector_freelist: set[int],
-    consts: dict[str, int],
-) -> FullComputationGraph:
-    # make all the batches, and merge_below into const
-    return FullComputationGraph(
-        make_all_batches_graph(forest_height, batch_size, rounds),
-        scalar_freelist,
-        vector_freelist,
-        consts,
-    )
-
-
-# BELOW THIS LINE IS WHERE NEW CODE IS
-# TODO:
-# - get rid of vload_scalar, valu_scalar; replace with (vreg @ i) syntax
-# ----------------------------------------
-
 CONST_PREFIX = "const "
 VECTOR_PREFIX = "v_"
 
@@ -1479,6 +170,19 @@ def infer_engine(op: str) -> (Engine, str):
     return engine, op
 
 
+# shifts needed to make a number in [0, 32)
+def calculate_shifts(n: int) -> list[int]:
+    assert 0 <= n < 32
+    shift = 0
+    shifts = []
+    while n > 0:
+        if n % 2 == 1:
+            shifts.append(shift)
+        n //= 2
+        shift += 1
+    return shifts
+
+
 ALU_OPS = {
     "+",
     "-",
@@ -1495,6 +199,8 @@ ALU_OPS = {
     "==",
 }
 
+Var = Union[str, tuple[str, int]]
+
 
 # Must be hashable to be added to DiGraph
 @dataclass(frozen=True)
@@ -1502,12 +208,12 @@ class SymbolicInstructionSlot:
     engine: Engine
     op: str
     args: tuple[Arg, ...]  # the only time we don't get Arg type is for `const`
-    dest: Optional[Arg] = None
     # Useful for if we want to impose concurrency limits later.
     batch: int
     round: int
     # Debugging purposes.
     comment: str = ""
+    dest: Optional[Arg] = None
 
     # Check that all variable names follow conventions/are valid for the given engine + op combo.
     # Also that the proper number of arguments are passed, and that the destination is properly defined.
@@ -1541,14 +247,15 @@ class SymbolicInstructionSlot:
                 # either vload or load; both load from scalar address
                 assert self.dest is not None
                 assert len(self.args) == 1
-                assert is_scalar(self.args[0])
                 if self.op == "vload":
+                    assert is_scalar(self.args[0])
                     assert is_vector(self.dest)
                 elif self.op == "const":
-                    assert len(self.args) == 1
                     assert isinstance(self.args[0], int)
+                    assert is_const(self.dest)
                 else:
                     assert self.op == "load"
+                    assert is_scalar(self.args[0])
                     assert is_scalar(self.dest)
             case "store":
                 # either vstore or store; both store to scalar address
@@ -1565,6 +272,12 @@ class SymbolicInstructionSlot:
                     assert self.dest is not None
                     assert len(self.args) == 3
                     assert all(is_vector(arg) for arg in self.args)
+                elif self.op == "add_imm":
+                    assert self.dest is not None
+                    assert is_scalar(self.dest)
+                    assert len(self.args) == 2
+                    assert is_scalar(self.args[0])
+                    assert isinstance(self.args[1], int)
                 else:
                     assert self.op == "pause"
             case "NO-OP":
@@ -1589,8 +302,9 @@ class SymbolicInstructionSlot:
 
     # Get all variables that this slot depends on.
     # This time, includes constants!
+    # Also includes offset vregs.
     @property
-    def dependencies(self) -> set[str]:
+    def dependencies(self) -> set[Var]:
         def is_var(arg: Arg) -> bool:
             if isinstance(arg, int):
                 return False
@@ -1659,65 +373,80 @@ def make_slot(
     )
 
 
-# Computation graph of VLIW slots that can be merged with other graphs.
-# TODO finish editing
 class ComputationGraph:
     def __init__(self):
         self.graph = nx.DiGraph()
-
         # Temporary staging while we build the graph.
-        self.inner_defs: dict[str, SymbolicInstructionSlot] = {}
-
-        # Incoming edges (external dependencies). Which slots depend on a given outside variable?
-        self.ext_deps: dict[str, list[SymbolicInstructionSlot]] = defaultdict(list)
+        self.inner_defs: dict[Var, SymbolicInstructionSlot] = {}
+        # If we draw a box around this graph, the ext_deps allow us to make connections between boxes via incoming edges, and exports are outgoing edges.
+        # The slots in this graph that depend on externally defined variables.
+        # Maps var name, slots that depend on that variable.
+        self.ext_deps: dict[Var, list[SymbolicInstructionSlot]] = defaultdict(list)
         # Outgoing edges (exported variables).
-        self.exports: dict[str, SymbolicInstructionSlot] = {}
+        self.exports: dict[Var, SymbolicInstructionSlot] = {}
 
+    # The associated var name must be the from_node's dest.
+    # This edge means that to_node has a dependency on from_node's output.
+    # TODO fake deps
     def add_edge(
         self,
         from_node: SymbolicInstructionSlot,
         to_node: SymbolicInstructionSlot,
-        var: str,  # can be either the dest or FAKE
+        var: Var,
     ):
         assert from_node in self.graph, f"originating node {from_node} must be in graph"
         assert to_node in self.graph, f"destination node {to_node} must be in graph"
-        assert var == "FAKE" or var == from_node.dest, (
-            f"var {var} is not the dest or FAKE"
-        )
-        self.graph.add_edge(from_node, to_node, data=var)
+        assert var != "FAKE"  # TODO add support
+        # assert var == "FAKE" or var == from_node.dest, (
+        #     f"var {var} is not the dest or FAKE"
+        # )
+        self.graph.add_edge(from_node, to_node, var=var)
 
     # Must add slots in dependency order.
-    # The last slot added to the graph must be marked. This defines the export.
+    # exports means this variable should live beyond the internal computations.
     def add_slot(self, slot: SymbolicInstructionSlot, exports=False):
         self.graph.add_node(slot)
-
         # Check that dependencies satisfied, and draw incoming edges
-        for arg in slot.dependencies:
+        for var in slot.dependencies:
+            if isinstance(var, tuple):
+                # For vmerge only, we use the tuple. Otherwise, we use the name.
+                if slot.op != "vmerge":
+                    var_name, offset = var
+                    var = var_name
             # Inner defs take precedence over upper defs
-            if arg in self.inner_defs:
+            if var in self.inner_defs:
                 # Draw edge from inner def's node to this one
-                # We don't need to mark with var name, because it's always the same as the originating node's `dest`
-                # TODO not true anymore! fake deps possible
-                self.add_edge(self.inner_defs[arg], slot, var=arg)
+                # Mark the edge with the name of the relevant arg
+                self.add_edge(self.inner_defs[var], slot, var=var)
                 continue
-            # Otherwise, we need this variable from outside our graph. Add to external dependencies; we will draw the edge later.
-            self.ext_deps[arg].append(slot)
+            # Otherwise, we need this variable from outside our graph. Add to external dependencies; we will draw the edge later, because it requires a source not visible to us.
+            self.ext_deps[var].append(slot)
 
         # if this slot defines a new variable, add to inner_defs
         # inner variables must be unique!
+        # this naturally comes out of vector offsets being paired
         if slot.has_def:
-            assert slot.dest not in self.inner_defs, (
-                f"inner variable {slot.dest} is already defined"
-            )
+            # If we write to a offset vector, we add it to inner defs and it must be joined with a vmerge
+            assert slot.dest not in self.inner_defs, f"{slot.dest = }"
             self.inner_defs[slot.dest] = slot
 
         if exports:
             self.exports[slot.dest] = slot
 
     def add_new_slot(
-        self, op: str, arg_names: list[str], dest: Optional[str] = None, exports=False
+        self,
+        op: str,
+        args: list[str],
+        dest: Optional[str] = None,
+        batch: Optional[int] = None,
+        round: Optional[int] = None,
+        comment: Optional[str] = "",
+        exports=False,
     ):
-        self.add_slot(make_slot(op, arg_names, dest=dest), exports=exports)
+        self.add_slot(
+            make_slot(op, args, dest=dest, batch=batch, round=round, comment=comment),
+            exports=exports,
+        )
 
     # Add another computation graph "below" this one.
     # `other` must have external dependencies that are either our external dependencies or things that we export.
@@ -1725,88 +454,892 @@ class ComputationGraph:
     def merge_below(self, other: "ComputationGraph"):
         # Merge, then add edges connecting them.
         self.graph = nx.union(self.graph, other.graph)
-        # Link up our outgoing edges to `other`'s incoming edges.
-        for var_name, slots in other.ext_deps.items():
+        # ext_deps is the lower graph's incoming edges that we need to draw
+        for var, slots in other.ext_deps.items():
             # If this graph has slots depending on something we produce, then we add edges connecting them.
-            if var_name in self.inner_defs:
+            if var in self.inner_defs:
                 for slot in slots:
-                    self.graph.add_edge(self.inner_defs[var_name], slot, var=var_name)
+                    self.graph.add_edge(self.inner_defs[var], slot, var=var)
                 continue
             # Otherwise, we add it as another external dependency.
-            self.ext_deps[var_name].extend(slots)
-
+            self.ext_deps[var].extend(slots)
         # `other`'s outgoing edges become part of our graph, but as inner defs
-        for var_name, slot in other.exports.items():
+        for var, slot in other.exports.items():
             # Make sure we're not already exporting this variable name
-            assert var_name not in self.exports
-            assert var_name not in self.inner_defs
-            self.inner_defs[var_name] = slot
+            assert var not in self.exports
+            assert var not in self.inner_defs
+            self.inner_defs[var] = slot
+
+    @staticmethod
+    def make_const_graph() -> "ComputationGraph":
+        cgraph = ComputationGraph()
+        for i in (0, 1, 2, 3, 4, 5, 8):
+            # Only export the ones that aren't 0. 0 is used for loading init_vars.
+            cgraph.add_new_slot("const", [i], dest=constn(i))
+        for i, (_, add_imm, _, _, shift_imm) in enumerate(HASH_STAGES):
+            cgraph.add_new_slot(
+                "const",
+                [add_imm],
+                dest=const(f"hash_add{i}"),
+            )
+            cgraph.add_new_slot(
+                "const",
+                [1 + 2**shift_imm if i in (0, 2, 4) else shift_imm],
+                dest=const(f"hash_mult{i}"),
+            )
+        # load init vars
+        init_vars = vconst("init_vars")
+        cgraph.add_new_slot(
+            "vload",
+            [constn(0)],
+            dest=init_vars,
+        )
+        forest_values_p = (init_vars, 4)
+        treevals_addr8 = const("treevals_addr8")
+        cgraph.add_new_slot("add_imm", [forest_values_p, 8], dest=treevals_addr8)
+        treevals_starting0, treevals_starting8 = (
+            vconst(f"treevals_starting{i}") for i in (0, 8)
+        )
+        cgraph.add_new_slot(
+            "vload",
+            [forest_values_p],
+            dest=treevals_starting0,
+        )
+        cgraph.add_new_slot(
+            "vload",
+            [treevals_addr8],
+            dest=treevals_starting8,
+        )
+        for i in range(len(HASH_STAGES)):
+            hash_addi = f"hash_add{i}"
+            cgraph.add_new_slot(
+                "vbroadcast",
+                [const(hash_addi)],
+                dest=vconst(hash_addi),
+            )
+            hash_multi = f"hash_mult{i}"
+            cgraph.add_new_slot(
+                "vbroadcast",
+                [const(hash_multi)],
+                dest=vconst(hash_multi),
+            )
+        cgraph.add_new_slot(
+            "vbroadcast",
+            [forest_values_p],
+            dest=vconst("forest_values_p"),
+        )
+        for i in (1, 2, 3, 5):
+            cgraph.add_new_slot(
+                "vbroadcast",
+                [constn(i)],
+                dest=vconstn(i),
+            )
+
+        assert len(cgraph.ext_deps) == 0
+        numerical = (1, 2, 3, 5)
+        assert all(constn(i) in cgraph.inner_defs for i in numerical)
+        assert all(vconstn(i) in cgraph.inner_defs for i in numerical)
+        assert all(
+            const(f"hash_add{i}") in cgraph.inner_defs for i in range(len(HASH_STAGES))
+        )
+        assert all(
+            const(f"hash_mult{i}") in cgraph.inner_defs for i in range(len(HASH_STAGES))
+        )
+        assert all(
+            vconst(f"hash_add{i}") in cgraph.inner_defs for i in range(len(HASH_STAGES))
+        )
+        assert all(
+            vconst(f"hash_mult{i}") in cgraph.inner_defs
+            for i in range(len(HASH_STAGES))
+        )
+        assert init_vars in cgraph.inner_defs
+        assert treevals_starting0 in cgraph.inner_defs
+        assert treevals_starting8 in cgraph.inner_defs
+        assert vconst("forest_values_p") in cgraph.inner_defs
+        assert len(cgraph.inner_defs) >= 2 * len(numerical) + 4 * len(HASH_STAGES) + 4
+        return cgraph
+
+    @staticmethod
+    def make_hash_graph(
+        batch: int,
+        round: int,
+        in_name: str,
+        out_name: str,
+    ) -> "ComputationGraph":
+        def vlocalize(name: str, hash_round: int) -> str:
+            return vector(f"{localize(name, batch, round)}_hashround{hash_round}")
+
+        cgraph = ComputationGraph()
+
+        def add_new_slot(op: str, args: list[str], dest: str, exports: bool = False):
+            cgraph.add_new_slot(
+                op, args, dest=dest, exports=exports, batch=batch, round=round
+            )
+
+        curr_in_name = in_name
+        for i, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
+            # Convert to valu operations
+            op1, op3 = (f"valu{op}" for op in (op1, op3))
+            # Make this round's output variable
+            curr_out_name = vlocalize("out", i)
+
+            if i in (0, 2, 4):
+                args = [curr_in_name, vconst(f"hash_mult{i}"), vconst(f"hash_add{i}")]
+                add_new_slot(
+                    "multiply_add",
+                    args,
+                    dest=curr_out_name,
+                )
+                curr_in_name = curr_out_name
+                continue
+            last_stage = i == len(HASH_STAGES) - 1
+            tmp1 = vlocalize("tmp1", i)
+            tmp2 = vlocalize("tmp2", i)
+            add_new_slot(op1, [curr_in_name, vconst(f"hash_add{i}")], dest=tmp1)
+            add_new_slot(op3, [curr_in_name, vconst(f"hash_mult{i}")], dest=tmp2)
+            target_name = out_name if last_stage else curr_out_name
+            for i in range(8):
+                add_new_slot(op2, [(tmp1, i), (tmp2, i)], dest=(target_name, i))
+            add_new_slot(
+                "vmerge",
+                [(target_name, i) for i in range(8)],
+                dest=target_name,
+                exports=last_stage,
+            )
+            curr_in_name = curr_out_name
+
+        rest_len = ComputationGraph.check_hash_deps(cgraph.ext_deps)
+        assert in_name in cgraph.ext_deps
+        assert rest_len == 1
+
+        assert len(cgraph.exports) == 1 and out_name in cgraph.exports
+        return cgraph
+
+    @staticmethod
+    def check_hash_deps(ext_deps: dict[str, SymbolicInstructionSlot]) -> int:
+        hash_adds = [vconst(f"hash_add{i}") for i in range(len(HASH_STAGES))]
+        hash_mults = [vconst(f"hash_mult{i}") for i in range(len(HASH_STAGES))]
+        assert all(var_name in ext_deps for var_name in hash_adds)
+        assert all(var_name in ext_deps for var_name in hash_mults)
+        diff = len(ext_deps) - (len(hash_adds) + len(hash_mults))
+        assert diff >= 0
+        return diff
+
+    @staticmethod
+    def make_top_layer_graph(
+        batch: int,
+        round: int,
+        forest_height: int,
+        val_in: str,
+        val_out: str,
+        treeval_out: str,
+        parity_out: str,
+    ) -> "ComputationGraph":
+        assert round % (forest_height + 1) == 0
+
+        def vlocalize_top(name: str) -> str:
+            return vlocalize(name, batch, round)
+
+        cgraph = ComputationGraph()
+
+        def add_new_slot(op: str, args: list[str], dest: str, exports: bool = False):
+            cgraph.add_new_slot(
+                op, args, dest=dest, exports=exports, batch=batch, round=round
+            )
+
+        treeval0 = vconst(f"treeval0_round{round}")
+        treeval1 = vconst(f"treeval1_round{round}")
+        treeval2 = vconst(f"treeval2_round{round}")
+
+        hash_in = vlocalize_top("hash_in")
+        add_new_slot("valu^", [val_in, treeval0], dest=hash_in)
+        cgraph.merge_below(
+            ComputationGraph.make_hash_graph(batch, round, hash_in, val_out)
+        )
+        cgraph.exports[val_out] = cgraph.inner_defs[val_out]
+        add_new_slot("valu%", [val_out, vconstn(2)], dest=parity_out, exports=True)
+        add_new_slot(
+            "vselect",
+            [
+                parity_out,
+                treeval2,
+                treeval1,
+            ],
+            dest=treeval_out,
+            exports=True,
+        )
+
+        assert val_in in cgraph.ext_deps
+        assert all(
+            treeval in cgraph.ext_deps for treeval in (treeval0, treeval1, treeval2)
+        )
+        assert vconstn(2) in cgraph.ext_deps
+        rest_len = ComputationGraph.check_hash_deps(cgraph.ext_deps)
+        assert rest_len == 5
+
+        assert len(cgraph.exports) == 3 and all(
+            name in cgraph.exports for name in (val_out, treeval_out, parity_out)
+        )
+        return cgraph
+
+    @staticmethod
+    def make_second_layer_graph(
+        batch: int,
+        round: int,
+        forest_height: int,
+        val_in: str,
+        parity_in: str,
+        treeval_in: str,
+        val_out: str,
+        idx_out: str,
+        treeval_out: str,
+    ) -> "ComputationGraph":
+        assert round % (forest_height + 1) == 1
+
+        def vlocalize_second(name: str) -> str:
+            return vlocalize(name, batch, round)
+
+        cgraph = ComputationGraph()
+
+        def add_new_slot(op: str, args: list[str], dest: str, exports: bool = False):
+            cgraph.add_new_slot(
+                op, args, dest=dest, exports=exports, batch=batch, round=round
+            )
+
+        hash_in = vlocalize_second("hash_in")
+        parity_curr = vlocalize_second("parity_curr")
+        idx_base = vlocalize_second("idx_base")
+        treeval3, treeval4, treeval5, treeval6 = (
+            vconst(f"treeval{i}_round{round}") for i in (3, 4, 5, 6)
+        )
+        sel_43 = vlocalize_second("sel_43")
+        sel_65 = vlocalize_second("sel_65")
+
+        add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
+        cgraph.merge_below(
+            ComputationGraph.make_hash_graph(batch, round, hash_in, val_out)
+        )
+        cgraph.exports[val_out] = cgraph.inner_defs[val_out]
+        add_new_slot("valu%", [val_out, vconstn(2)], dest=parity_curr)
+        add_new_slot("multiply_add", [parity_in, vconstn(2), vconstn(3)], dest=idx_base)
+        add_new_slot("valu+", [idx_base, parity_curr], dest=idx_out, exports=True)
+        add_new_slot("vselect", [parity_curr, treeval4, treeval3], dest=sel_43)
+        add_new_slot("vselect", [parity_curr, treeval6, treeval5], dest=sel_65)
+        add_new_slot(
+            "vselect", [parity_in, sel_65, sel_43], dest=treeval_out, exports=True
+        )
+
+        assert all(name in cgraph.ext_deps for name in (val_in, parity_in, treeval_in))
+        assert all(
+            name in cgraph.ext_deps for name in (treeval3, treeval4, treeval5, treeval6)
+        )
+        assert all(vconstn(i) in cgraph.ext_deps for i in (2, 3))
+        rest_len = ComputationGraph.check_hash_deps(cgraph.ext_deps)
+        assert rest_len == 3 + 4 + 2
+
+        assert all(name in cgraph.exports for name in (val_out, idx_out, treeval_out))
+        assert len(cgraph.exports) == 3
+        return cgraph
+
+    @staticmethod
+    def make_mid_layer_graph(
+        batch: int,
+        round: int,
+        rounds: int,
+        forest_height: int,
+        val_in: str,
+        idx_in: str,
+        treeval_in: str,
+        val_out: str,
+        idx_out: str,
+        treeval_out: str,
+    ) -> "ComputationGraph":
+        assert 2 <= round % (forest_height + 1) <= forest_height - 1
+        assert round != rounds - 1
+
+        def vlocalize_mid(name: str) -> str:
+            return vlocalize(name, batch, round)
+
+        cgraph = ComputationGraph()
+
+        def add_new_slot(op: str, args: list[str], dest: str, exports: bool = False):
+            cgraph.add_new_slot(
+                op, args, dest=dest, exports=exports, batch=batch, round=round
+            )
+
+        hash_in = vlocalize_mid("hash_in")
+        idx_base = vlocalize_mid("idx_base")
+        parity = vlocalize_mid("parity")
+        val_addrs = vlocalize_mid("val_addrs")
+        add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
+        cgraph.merge_below(
+            ComputationGraph.make_hash_graph(batch, round, hash_in, val_out)
+        )
+        cgraph.exports[val_out] = cgraph.inner_defs[val_out]
+        add_new_slot("multiply_add", [vconstn(2), idx_in, vconstn(1)], dest=idx_base)
+        add_new_slot("valu%", [val_out, vconstn(2)], dest=parity)
+        add_new_slot("valu+", [idx_base, parity], dest=idx_out, exports=True)
+        add_new_slot("valu+", [vconst("forest_values_p"), idx_out], dest=val_addrs)
+        # 8 scalar loads
+        for i in range(8):
+            add_new_slot("load", [(val_addrs, i)], dest=(treeval_out, i))
+        add_new_slot(
+            "vmerge",
+            [(treeval_out, i) for i in range(8)],
+            dest=treeval_out,
+            exports=True,
+        )
+
+        assert all(name in cgraph.ext_deps for name in (val_in, idx_in, treeval_in))
+        assert all(vconstn(i) in cgraph.ext_deps for i in (1, 2))
+        assert vconst("forest_values_p") in cgraph.ext_deps
+        rest_len = ComputationGraph.check_hash_deps(cgraph.ext_deps)
+        assert rest_len == 3 + 2 + 1, f"{cgraph.ext_deps.keys()}"
+
+        assert all(name in cgraph.exports for name in (val_out, idx_out, treeval_out))
+        assert len(cgraph.exports) == 3
+        return cgraph
+
+    @staticmethod
+    def make_wraparound_layer_graph(
+        batch: int,
+        round: int,
+        forest_height: int,
+        val_in: str,
+        treeval_in: str,
+        val_out: str,
+    ) -> "ComputationGraph":
+        assert (round + 1) % (forest_height + 1) == 0
+
+        def vlocalize_wraparound(name: str) -> str:
+            return vlocalize(name, batch, round)
+
+        cgraph = ComputationGraph()
+
+        def add_new_slot(op: str, args: list[str], dest: str, exports: bool = False):
+            cgraph.add_new_slot(
+                op, args, dest=dest, exports=exports, batch=batch, round=round
+            )
+
+        hash_in = vlocalize_wraparound("hash_in")
+        add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
+        cgraph.merge_below(
+            ComputationGraph.make_hash_graph(batch, round, hash_in, val_out)
+        )
+        cgraph.exports[val_out] = cgraph.inner_defs[val_out]
+
+        assert all(name in cgraph.ext_deps for name in (val_in, treeval_in))
+        rest_len = ComputationGraph.check_hash_deps(cgraph.ext_deps)
+        assert rest_len == 2
+
+        assert val_out in cgraph.exports
+        assert len(cgraph.exports) == 1
+        return cgraph
+
+    @staticmethod
+    def make_last_layer_graph(
+        batch: int,
+        round: int,
+        rounds: int,
+        val_in: str,
+        treeval_in: str,
+    ) -> "ComputationGraph":
+        assert round == rounds - 1
+
+        def localize_last(name: str) -> str:
+            return localize(name, batch, round)
+
+        def vlocalize_last(name: str) -> str:
+            return vlocalize(name, batch, round)
+
+        cgraph = ComputationGraph()
+
+        def add_new_slot(
+            op: str, args: list[str], dest: str = None, exports: bool = False
+        ):
+            cgraph.add_new_slot(
+                op, args, dest=dest, exports=exports, batch=batch, round=round
+            )
+
+        hash_in = vlocalize_last("hash_in")
+        val_final = vlocalize_last("val_final")
+        addr_end = localize_last("addr_end")
+        add_new_slot("valu^", [val_in, treeval_in], dest=hash_in)
+        cgraph.merge_below(
+            ComputationGraph.make_hash_graph(batch, round, hash_in, val_final)
+        )
+        add_new_slot("add_imm", [(vconst("init_vars"), 6), batch], dest=addr_end)
+        add_new_slot("vstore", [addr_end, val_final])
+
+        assert all(name in cgraph.ext_deps for name in (val_in, treeval_in))
+        assert vconst("init_vars") in cgraph.ext_deps
+        rest_len = ComputationGraph.check_hash_deps(cgraph.ext_deps)
+        assert rest_len == 3
+
+        assert len(cgraph.exports) == 0
+        return cgraph
+
+    @staticmethod
+    def make_init_load_graph(batch: int, val_init_out: str) -> "ComputationGraph":
+        cgraph = ComputationGraph()
+
+        def add_new_slot(op: str, args: list[str], dest: str, exports: bool = False):
+            cgraph.add_new_slot(op, args, dest=dest, exports=exports, batch=batch)
+
+        tmp_offset = [batch_localize(f"tmp_offset{i}", batch) for i in range(5)]
+        tmp_offset_sum = [batch_localize(f"tmp_offset_sum{i}", batch) for i in range(4)]
+        tmp_offset_final = batch_localize("tmp_offset_final", batch)
+        curr_addr = batch_localize("addr_start", batch)
+
+        batch_prime = batch // 8
+        inp_values_p = (vconst("init_vars"), 6)
+
+        if batch_prime == 0:
+            add_new_slot("vload", [inp_values_p], dest=val_init_out, exports=True)
+            return cgraph
+        if batch_prime == 1:
+            add_new_slot("+", [inp_values_p, constn(8)], dest=curr_addr)
+            add_new_slot("vload", [curr_addr], dest=val_init_out, exports=True)
+            return cgraph
+
+        shifts = calculate_shifts(batch_prime)
+        if len(shifts) == 1:
+            # power of 2
+            shift = shifts[0]
+            add_new_slot("<<", [constn(1), constn(shift)], dest=tmp_offset[0])
+            add_new_slot("*", [constn(8), tmp_offset[0]], dest=tmp_offset_final)
+            add_new_slot(
+                "+",
+                [inp_values_p, tmp_offset_final],
+                dest=curr_addr,
+                exports=True,
+            )
+            add_new_slot("vload", [curr_addr], dest=val_init_out, exports=True)
+            return cgraph
+        # shifts
+        for i, shift in enumerate(shifts):
+            add_new_slot("<<", [constn(1), constn(shift)], dest=tmp_offset[i])
+        # sums -- this part is variable
+        if len(shifts) == 2:
+            add_new_slot("+", [tmp_offset[0], tmp_offset[1]], dest=tmp_offset_sum[0])
+            add_new_slot("*", [constn(8), tmp_offset_sum[0]], dest=tmp_offset_final)
+        if len(shifts) == 3:
+            add_new_slot("+", [tmp_offset[0], tmp_offset[1]], dest=tmp_offset_sum[0])
+            add_new_slot(
+                "+", [tmp_offset_sum[0], tmp_offset[2]], dest=tmp_offset_sum[1]
+            )
+            add_new_slot("*", [constn(8), tmp_offset_sum[1]], dest=tmp_offset_final)
+        elif len(shifts) == 4:
+            add_new_slot("+", [tmp_offset[0], tmp_offset[1]], dest=tmp_offset_sum[0])
+            add_new_slot("+", [tmp_offset[2], tmp_offset[3]], dest=tmp_offset_sum[1])
+            add_new_slot(
+                "+",
+                [tmp_offset_sum[0], tmp_offset_sum[1]],
+                dest=tmp_offset_sum[2],
+            )
+            add_new_slot("*", [constn(8), tmp_offset_sum[2]], dest=tmp_offset_final)
+        elif len(shifts) == 5:
+            add_new_slot("+", [tmp_offset[0], tmp_offset[1]], dest=tmp_offset_sum[0])
+            add_new_slot("+", [tmp_offset[2], tmp_offset[3]], dest=tmp_offset_sum[1])
+            add_new_slot(
+                "+",
+                [tmp_offset_sum[0], tmp_offset_sum[1]],
+                dest=tmp_offset_sum[2],
+            )
+            add_new_slot(
+                "+", [tmp_offset_sum[2], tmp_offset[4]], dest=tmp_offset_sum[3]
+            )
+            add_new_slot("*", [constn(8), tmp_offset_sum[3]], dest=tmp_offset_final)
+
+        # final addr calc and load
+        add_new_slot(
+            "+",
+            [inp_values_p, tmp_offset_final],
+            dest=curr_addr,
+            exports=True,
+        )
+        add_new_slot("vload", [curr_addr], dest=val_init_out, exports=True)
+
+        return cgraph
+
+    @staticmethod
+    def make_batch_graph(
+        batch: int,
+        rounds: int,
+        forest_height: int,
+    ) -> "ComputationGraph":
+        cgraph = ComputationGraph()
+
+        def add_new_slot(op: str, args: list[str], dest: str, exports: bool = False):
+            cgraph.add_new_slot(op, args, dest=dest, exports=exports, batch=batch)
+
+        val_init = vbatch_localize("val_init", batch)
+        cgraph.merge_below(ComputationGraph.make_init_load_graph(batch, val_init))
+        for round in range(rounds):
+            # Output vars for this round
+            val_out = vlocalize("val", batch, round)
+            idx_out = vlocalize("idx", batch, round)
+            treeval_out = vlocalize("treeval", batch, round)
+            parity_out = vlocalize("parity", batch, round)
+            # And the corresponding input vars
+            val_in = vlocalize("val", batch, round - 1)
+            idx_in = vlocalize("idx", batch, round - 1)
+            treeval_in = vlocalize("treeval", batch, round - 1)
+            parity_in = vlocalize("parity", batch, round - 1)
+
+            if round % (forest_height + 1) == 0:
+                val_in = val_init if round == 0 else val_in
+                cgraph.merge_below(
+                    ComputationGraph.make_top_layer_graph(
+                        batch,
+                        round,
+                        forest_height,
+                        val_in,
+                        val_out,
+                        treeval_out,
+                        parity_out,
+                    )
+                )
+            elif round % (forest_height + 1) == 1:
+                cgraph.merge_below(
+                    ComputationGraph.make_second_layer_graph(
+                        batch,
+                        round,
+                        forest_height,
+                        val_in,
+                        parity_in,
+                        treeval_in,
+                        val_out,
+                        idx_out,
+                        treeval_out,
+                    )
+                )
+            elif (round + 1) % (forest_height + 1) == 0:
+                cgraph.merge_below(
+                    ComputationGraph.make_wraparound_layer_graph(
+                        batch, round, forest_height, val_in, treeval_in, val_out
+                    )
+                )
+            elif round == rounds - 1:
+                cgraph.merge_below(
+                    ComputationGraph.make_last_layer_graph(
+                        batch, round, rounds, val_in, treeval_in
+                    )
+                )
+            else:
+                cgraph.merge_below(
+                    ComputationGraph.make_mid_layer_graph(
+                        batch,
+                        round,
+                        rounds,
+                        forest_height,
+                        val_in,
+                        idx_in,
+                        treeval_in,
+                        val_out,
+                        idx_out,
+                        treeval_out,
+                    )
+                )
+
+        # treeval0,1,2 for round 0/11
+        # treeval3, 4, 5, 6 for round 1/12
+        # vconstn 1, 2, 3, 5
+        # vconst(forest_values_p)
+        top_layer_treevals = [
+            vconst(f"treeval{i}_round{round}")
+            for i in (0, 1, 2)
+            for round in range(0, rounds, forest_height + 1)
+        ]
+        second_layer_treevals = [
+            vconst(f"treeval{i}_round{round}")
+            for i in (3, 4, 5, 6)
+            for round in range(1, rounds, forest_height + 1)
+        ]
+        vconstns = [vconstn(i) for i in (1, 2, 3)]
+        assert all(treeval in cgraph.ext_deps for treeval in top_layer_treevals)
+        assert all(treeval in cgraph.ext_deps for treeval in second_layer_treevals)
+        assert all(vconstn in cgraph.ext_deps for vconstn in vconstns)
+        assert vconst("forest_values_p") in cgraph.ext_deps
+        assert vconst("init_vars") in cgraph.ext_deps
+        ComputationGraph.check_hash_deps(cgraph.ext_deps)
+        # assert (
+        #     rest_len
+        #     == len(top_layer_treevals) + len(second_layer_treevals) + len(vconstns) + 2
+        # ), f"{cgraph.ext_deps.keys()}"
+
+        assert len(cgraph.exports) == 0
+        return cgraph
+
+    @staticmethod
+    def make_kernel_graph(
+        forest_height: int,
+        batch_size: int,
+        rounds: int,
+    ) -> "ComputationGraph":
+        cgraph = ComputationGraph.make_const_graph()
+        # vbroadcast for round 0/11
+        for round in range(0, rounds, forest_height + 1):
+            cgraph.add_new_slot(
+                "vbroadcast",
+                [(vconst("treevals_starting0"), 0)],
+                dest=vconst(f"treeval0_round{round}"),
+            )
+            for i in (1, 2):
+                cgraph.add_new_slot(
+                    "vbroadcast",
+                    [(vconst("treevals_starting0"), i)],
+                    dest=vconst(f"treeval{i}_round{round}"),
+                )
+        for round in range(1, rounds, forest_height + 1):
+            for i in (3, 4, 5, 6):
+                cgraph.add_new_slot(
+                    "vbroadcast",
+                    [(vconst("treevals_starting0"), i)],
+                    dest=vconst(f"treeval{i}_round{round}"),
+                )
+
+        for batch in range(0, batch_size, VLEN):
+            cgraph.merge_below(
+                ComputationGraph.make_batch_graph(batch, rounds, forest_height)
+            )
+
+        assert len(cgraph.ext_deps) == 0, f"{cgraph.ext_deps.keys()}"
+        assert len(cgraph.exports) == 0, f"{cgraph.exports.keys()}"
+        return cgraph
 
 
-def make_const_graph() -> ComputationGraph:
-    graph = ComputationGraph()
-    # Scalar constants: numerical, VLEN, and hash
-    for i in (0, 1, 2, 3, 4, 5, 6, 7):
-        graph.add_new_slot("const", [i], dest=constn(i))
-    s_vlen = const("s_vlen")
-    graph.add_new_slot("const", [VLEN], dest=s_vlen)
-    for i, (_, add_imm, _, _, shift_imm) in enumerate(HASH_STAGES):
-        if i in (0, 2, 4):
-            shift_imm = 1 + 2**shift_imm
-        graph.add_new_slot("const", [add_imm], dest=const(f"hash_add{i}"))
-        graph.add_new_slot("const", [shift_imm], dest=const(f"hash_mult{i}"))
-    # vload the initial variables
-    init_vars = vconst("init_vars")
-    graph.add_new_slot("vload", [constn(0)], dest=init_vars)
+class KernelGraph:
+    def __init__(
+        self,
+        cgraph: ComputationGraph,
+        scalar_freelist: set[int],
+        vector_freelist: set[int],
+    ):
+        self.graph = cgraph.graph
+        self.using = {}
+        self.scalar_freelist = scalar_freelist
+        self.vector_freelist = vector_freelist
+        # Whenever we remove a node from the graph, we've scheduled it and its dest var is active.
+        # So we need to keep track of number of forward dependencies.
+        # When the last edge is removed, we can free the register.
+        self.refcounts: dict[Var, int] = {}
+        self.distance_to_notable = {}
+        self.longest_dep_chain = {}
+        self.min_vector_freelist_len = float("inf")
+        self.__post_init__()
 
-    # Address calculations
-    treevals_addr8, treevals_addr16, treevals_addr24 = (
-        vector(f"treevals_addr{i}") for i in (8, 16, 24)
-    )
-    graph.add_new_slot("+", [(init_vars, 3), s_vlen], dest=treevals_addr8)
-    graph.add_new_slot("+", [treevals_addr8, s_vlen], dest=treevals_addr16)
-    graph.add_new_slot("+", [treevals_addr16, s_vlen], dest=treevals_addr24)
+    def __post_init__(self):
+        # Check that all variables have unique names in the graph
+        vars = set()
+        for node in self.graph.nodes:
+            if node.dest is not None:
+                assert node.dest not in vars
+                vars.add(node.dest)
+        # Get rid of dead code (terminals that are not stores)
+        self.elim_dead_code()
+        assert all(
+            self.graph.out_degree(node) > 0
+            for node in self.graph.nodes
+            if node.engine != "store"
+        )
+        self.prune_noops()  # TODO fix
+        self.populate_heuristics()
 
-    # vloads
-    treevals_starting0, treevals_starting8, treevals_starting16, treevals_starting24 = (
-        vconst(f"treevals_starting{i}") for i in (0, 8, 16, 24)
-    )
-    graph.add_new_slot("vload", [(init_vars, 3)], dest=treevals_starting0)
-    graph.add_new_slot("vload", [treevals_addr8], dest=treevals_starting8)
-    graph.add_new_slot("vload", [treevals_addr16], dest=treevals_starting16)
-    graph.add_new_slot("vload", [treevals_addr24], dest=treevals_starting24)
+    def elim_dead_code(self):
+        while True:
+            terminals = [
+                node
+                for node in self.graph.nodes
+                if self.graph.out_degree(node) == 0 and node.engine != "store"
+            ]
+            if len(terminals) == 0:
+                break
+            for terminal in terminals:
+                self.graph.remove_node(terminal)
 
-    # vbroadcast tree values
-    for i in range(8):
-        graph.add_new_slot(
-            "vbroadcast", [(treevals_starting0, i)], dest=vconst(f"treeval{i}")
-        )
-    for i in range(8):
-        graph.add_new_slot(
-            "vbroadcast", [treevals_starting8, i], dest=vconst(f"treeval{8 + i}")
-        )
-    for i in range(8):
-        graph.add_new_slot(
-            "vbroadcast", [treevals_starting16, i], dest=vconst(f"treeval{16 + i}")
-        )
-    for i in range(8):
-        graph.add_new_slot(
-            "vbroadcast", [treevals_starting24, i], dest=vconst(f"treeval{24 + i}")
-        )
-    # vbroadcast hash values
-    for i in range(len(HASH_STAGES)):
-        graph.add_new_slot(
-            "vbroadcast", [const(f"hash_add{i}")], dest=vconst(f"hash_add{i}")
-        )
-        graph.add_new_slot(
-            "vbroadcast", [const(f"hash_mult{i}")], dest=vconst(f"hash_mult{i}")
-        )
-    # vbroadcast forest_values_p pointer
-    graph.add_new_slot("vbroadcast", [(init_vars, 3)], dest=vconst("forest_values_p"))
-    # vbroadcast i values
-    for i in (1, 2, 3, 7, 15):
-        graph.add_new_slot("vbroadcast", [constn(i)], dest=vconstn(i))
+    def prune_noops(self):
+        leaves = self.leaves
+        for leaf in leaves:
+            if leaf.engine != "NO-OP":
+                continue
+            assert leaf.op == "vmerge"
+            # The underlying register should have already been allocated
+            assert leaf.dest in self.using
+            # Which slots depend on this one?
+            n_forward_deps = self.graph.out_degree(leaf)
+            assert n_forward_deps > 0
+            assert leaf.dest not in self.refcounts
+            self.refcounts[leaf.dest] = n_forward_deps
+            self.graph.remove_node(leaf)
 
+    def populate_heuristics(self):
+        self.distance_to_notable = {}
+        self.longest_dep_chain = {}
+        for node in reversed(list(nx.topological_sort(self.graph))):
+            self.longest_dep_chain[node] = (
+                max(
+                    (
+                        self.longest_dep_chain[succ]
+                        for succ in self.graph.successors(node)
+                    ),
+                    default=0,
+                )
+                + 1
+            )
+            if node.is_notable:
+                self.distance_to_notable[node] = 0
+            else:
+                self.distance_to_notable[node] = (
+                    min(
+                        (
+                            self.distance_to_notable[succ]
+                            for succ in self.graph.successors(node)
+                        ),
+                        default=float("inf"),
+                    )
+                    + 1
+                )
+
+    @property
+    def leaves(self) -> list[SymbolicInstructionSlot]:
+        return [node for node in self.graph.nodes if self.graph.in_degree(node) == 0]
+
+    @property
+    def has_more_work(self) -> bool:
+        return self.graph.number_of_nodes() > 0
+
+    # Allocate output reg. If a vector offset, allocate it only once.
+    def alloc_outreg(self, var: Var) -> int:
+        if isinstance(var, tuple):
+            vname, offset = var
+            if vname in self.using:
+                return self.using[vname] + offset
+            if len(self.vector_freelist) == 0:
+                print(self.using)
+            reg = self.vector_freelist.pop()
+            if len(self.vector_freelist) < self.min_vector_freelist_len:
+                self.min_vector_freelist_len = len(self.vector_freelist)
+                print(f"New min vector freelist len: {self.min_vector_freelist_len}")
+            self.using[vname] = reg
+            return reg + offset
+        if is_vector(var):
+            if len(self.vector_freelist) == 0:
+                print(self.using)
+            reg = self.vector_freelist.pop()
+            if len(self.vector_freelist) < self.min_vector_freelist_len:
+                self.min_vector_freelist_len = len(self.vector_freelist)
+                print(f"New min vector freelist len: {self.min_vector_freelist_len}")
+            self.using[var] = reg
+            return reg
+        assert is_scalar(var)
+        reg = self.scalar_freelist.pop()
+        self.using[var] = reg
+        return reg
+
+    # Frees the variable associated with a given variable name.
+    def free_outreg(self, var: Var):
+        if isinstance(var, tuple):
+            # If this is a vector offset variable, it should have been allocated. vmerge will take care of this; we shouldn't actually free yet.
+            vname, offset = var
+            assert vname in self.using
+            return
+        assert var in self.using
+        if is_vector(var):
+            self.vector_freelist.add(self.using.pop(var))
+            return
+        assert is_scalar(var)
+        self.scalar_freelist.add(self.using.pop(var))
+
+    def schedule_round(self, round_i: int) -> Instruction:
+        self.prune_noops()
+        assert self.has_more_work
+        bundle = defaultdict(list)
+
+        def can_schedule(leaf: SymbolicInstructionSlot) -> bool:
+            return len(bundle[leaf.engine]) < SLOT_LIMITS[leaf.engine]
+
+        leaves = self.leaves
+        # leaves.sort(key=lambda x: self.longest_dep_chain[x], reverse=True)
+        # leaves.sort(key=lambda x: self.distance_to_notable[x])
+        leaves.sort(
+            key=lambda x: self.longest_dep_chain[x] - self.distance_to_notable[x],
+            reverse=True,
+        )
+        for leaf in leaves:
+            if not can_schedule(leaf):
+                continue
+            # Heuristic: don't immediately calculate ending addresses
+            if leaf.op == "add_imm" and round_i < 50:
+                continue
+
+            # Allocate output reg
+            out_reg = None
+            if leaf.dest is not None:
+                out_reg = self.alloc_outreg(leaf.dest)
+
+            # concrete-ize the slot
+            engine, inst = leaf.to_concrete(self.using, out_reg=out_reg)
+            assert engine != "NO-OP"
+            bundle[engine].append(inst)
+
+            # reftracking
+            # we are now defining the variable; we need to see how many depend on it
+            # TODO: if fake dep, then need to check edge annotations
+            n_forward_deps = self.graph.out_degree(leaf)
+            if leaf.dest is None:
+                assert n_forward_deps == 0
+            else:
+                assert n_forward_deps > 0
+                assert leaf.dest not in self.refcounts
+                self.refcounts[leaf.dest] = n_forward_deps
+
+            # this might also be the last time one of our dependencies is used; if that's the case, free the register
+            for arg in leaf.dependencies:
+                if isinstance(arg, tuple):
+                    if leaf.op != "vmerge":
+                        var_name, offset = arg
+                        arg = var_name
+                self.refcounts[arg] -= 1
+                if self.refcounts[arg] == 0:
+                    # If this is a vector offset register, don't get rid of it yet! The vmerge reuses the same register
+                    if isinstance(arg, tuple):
+                        del self.refcounts[arg]
+                        continue
+                    reg = self.using.pop(arg)
+                    if is_vector(arg):
+                        self.vector_freelist.add(reg)
+                    else:
+                        self.scalar_freelist.add(reg)
+
+            # finally, remove this leaf; expose more work
+            self.graph.remove_node(leaf)
+
+        return bundle
+
+    def generate_code(self):
+        code = []
+        orig_sfreelist_len = len(self.scalar_freelist)
+        orig_vfreelist_len = len(self.vector_freelist)
+        round_i = 0
+        while self.has_more_work:
+            bundle = self.schedule_round(round_i)
+            code.append(bundle)
+            round_i += 1
+        assert len(self.scalar_freelist) == orig_sfreelist_len
+        assert len(self.vector_freelist) == orig_vfreelist_len
+        return code
+
+    @staticmethod
+    def make_graph(
+        forest_height: int,
+        batch_size: int,
+        rounds: int,
+        scalar_freelist: set[int],
+        vector_freelist: set[int],
+    ) -> "KernelGraph":
+        cgraph = ComputationGraph.make_kernel_graph(forest_height, batch_size, rounds)
+        return KernelGraph(cgraph, scalar_freelist, vector_freelist)
 
 class KernelBuilder:
     def __init__(self):
@@ -1818,6 +1351,10 @@ class KernelBuilder:
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
+
+    def add(self, engine, slot):
+        assert engine in ("flow", "debug"), "only flow and debug can be entire cycles"
+        self.instrs.append({engine: [slot]})
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -1851,24 +1388,15 @@ class KernelBuilder:
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
+        # needed to match with reference
+        self.add("flow", ("pause",))
         N_SCALAR_REG = 64
         scalar_freelist, vector_freelist = self.make_freelists(N_SCALAR_REG)
-
-        # required to match with reference
-        self.add("flow", ("pause",))
-        # make_kernel_graph should contain the const code within itself.
-        self.instrs.extend(
-            make_kernel_graph(
-                forest_height,
-                batch_size,
-                rounds,
-                scalar_freelist,
-                vector_freelist,
-            ).generate_code()
+        kernel_graph = KernelGraph.make_graph(
+            forest_height, batch_size, rounds, scalar_freelist, vector_freelist
         )
-
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        self.instrs.extend(kernel_graph.generate_code())
+        self.add("flow", ("pause",))
 
 
 BASELINE = 147734

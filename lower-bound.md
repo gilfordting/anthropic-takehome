@@ -1,68 +1,72 @@
 # lower bounding the runtime
 
-- cycle reasoning
+## N = 3
 
-## load
+we have round 0, 1: cached
+round 2, 3, 4, 5, 6, 7, 8, 9: load the next round
+round 10: no load needed; wraparound
+round 11, 12: cached
+round 13, 14: load the next round
+round 15: next loading not needed, since store
 
-- in each round, we must load 256 items, and scalar load throughput is 2 loads per cycle
-  - if we cache N rounds (N <= 5) we avoid loading for 2N rounds
-  - so (16-2N) * 256 / 2 = 2048 - 256N cycles
-  - so it is possible to get to **1024 cycles** if we cache 4 layers
-- this is 1, 2, 4, 8 values -- 15 vectors. this is 7.8% of the register file. suspect we will have to vbroadcast on the fly
-  - if not, each batch has on avg 2.25 reg -- not a lot
-  - but if we vbroadcast, we have 1.04% of the register file instead
+### load
 
-## alu
+- constant defs
+  - 5 + 12 const loads
+  - 3 vloads
+- batch-wise:
+  - mid rounds, 10 of these
+    - 8 scalar loads
+  - top of batch
+    - 1 vload
 
-- throughputs
-  - arithmetic: 7.5 vops/cycle
-  - vbroadcast, fma: 6 vops/cycle
+this is 17 scalar + 3 vload for the entire kernel
+and 10 * 8 scalar + 1 vload for a single batch
+so 20 + 32\*81 load slots = 2612 slots, **1306 cycles**
 
-- hash
-  - 3 fmas, 3*3 regular vops, xor on input: 3/6 cycles + 10/7.5 cycles = 1.8333 cycles
-    - 16 rounds, 32 batches: **938.67 cycles**
-  - seems unlikely this can be driven down any further; ^ can't be converted to * or +, and there are a lot of these. only exception is (x + c) ^ (x << d); don't think we can turn this into an fma
+if we cache one more round, theoretical optimum is **1050 cycles**
 
-- vbroadcasts for constants
-  - round 0: 1 thing (treeval0)
-  - round 1: 2 things (treeval1, 2)
-  - round 2: 4 things (treeval 3-6)
-  - round 3: 8 things (treeval 7-14)
-  - 15 things \* 2 repetitions \* 32 batches = 960 vbroadcasts = **160 cycles**
+### alu
 
-- regular mid round
-  - fma on idx calc, % on parity, + on idx_out, + on val_addrs -- 1 vop, 3 scalarizable vops
-  - 1/6 of a cycle + 3/7.5 of a cycle = 0.5666 cycles per round; for 8 rounds, for 32 batches = **179.2 cycles**
+throughputs:
+
+- regular vops: 7.5 vops/cycle
+- vbroadcast, fma: 6 vops/cycle
+
+- constant defs
+  - 6 * 2 + 1 + 4 = 17 vbroadcasts
+- batch-wise:
+  - hash, 16 of these
+    - each is 3 fmas, 9 vops
+  - round 0/11: 2 vops
+  - round 1/12: 3 vops
+  - mid rounds (10 of these)
+    - 4 vops, 1 fma
+  - round 10, wraparound: 1
+  - round 15, last: 1
+- kernel-wide:
+  - 2 + 2 \* 2 + 4 \* 2 = 14 vbroadcasts
+  - 16 more for N = 4
+- so 17 vbroadcast + 32\*(16\*3 + 10\*1) fmas + 14 vbroadcast = 1887 valu-specific ops = 314.5 cycles
+- 32\*(16\*9 + 2\*2 + 2\*3 + 10\*4 + 1 + 1) = 6272 vops = 836.266 cycles
+- in total, **1150.766 cycles**
+
+### flow
+
+- const defs:
+  - 1 add_imm
+- batch-wise:
+  - initial load: 1 add_imm
+  - round 0/11: 1 vselect
+  - round 1/12: 4 vselect
+  - round 15, last: 1 add_imm
+
+1 + 32\*(1+2\*1+2\*4+1) = **385 cycles**
 
 ### ratio of valu to non-valu
 
-- ratio of VALU slots to ALU slots is 6:12 -- how to achieve this in steady-state?
-  - hash:
-    - 3 rounds of multiply_add
-    - 3 rounds of 3 regular vops
-    - so in total, there are 12 vops to be done
-    - if $n$ is the number of vops we scalarize, with $n \leq 9$ then ratio of valu to alu is (12-n) / 8n
-    - want this roughly equal to 1/2
-    - 24-2n = 8n; 10n = 24; n = 2.4
-  - also the other ops:
-    - hash_in calc (^), idx_tmp calc (fma), parity (%), idx_out(+), val_addrs calc (+)
-  - in total:
-    - 4 fma
-    - 13 vops
-    - (17 - n) / 8n = 1/2
-    - 34 - 2n = 8n
-    - n = 3.4
-  - this is applicable for most cycles
-  - in steady state, we need a ratio of 12 ALU slots :
-
-## flow
-
-- the more we cache, the more we have to parse
-  - level 0: none
-  - level 1: 2, 1 vselect
-  - level 2: 4, 3 vselect
-  - level 3: 8, 7 vselect
-  - 11 vselect for 4 levels, \* 2 for wraparound = 22 vselect per batch * 32 batches = **704 cycles**
-- might as well just linearize?
-  - the tree formulation is not faster than just linearizing and making a larger dep chain
-  - can we make reg usage better for condition vars?
+- there are 1887 valu-specific ops, and 6272 vops
+- if we want to achieve ratio of VALU:ALU of 6:12 = 1/2, we need:
+- (1887 + 6272 - n)/8n = 1/2; n <= 6272; n is the number of vops we scalarize
+- 2\*(8159-n) = 8n; n = 1631.8; /32 = 51 ops per batch; roughly 3 ops per hash (48)
+  - can make it a little higher to get better util?

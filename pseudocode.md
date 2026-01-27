@@ -1,73 +1,38 @@
 # pseudocode
 
+- TODO: add in round 2, with live range analysis
+- TODO: scalarize hash round after doing analysis
+- TODO: verify that treeval consts are NOT batch localized!
+
 ## constant defs
 
-- all constants should be exported
+- vconstn 1 2 3 5: 3 and 5 can be JIT-broadcasted if we really need register space
 
 ```asm
-# Const loads
-for i in (0, 1, 2, 3, 4, 7)
-for i in (8, 16, 24)
-const load "const i" <- i
+for i in (0, 1, 2, 3, 5)
+const load constn(i) i
 
+for i in hash stages
+const load const(hash_add_i) VALUE
+const load const(hash_mult_i) VALUE
 
+vload vconst(init_vars) <- constn(0)
 
-const load "const s_vlen" <- 8
+treevals_addr8 = vconst(init_vars) @ 3 + 8 (add_imm)
+vload vconst(treevals_starting0) <- vconst(init_vars) @ 3
+vload vconst(treevals_starting8) <- treevals_addr8
 
-const load "const hash_add0" <VALUE>
-...
-const load "const hash_add5" <VALUE>
+for i in hash stages
+vbroadcast vconst(hash_add_i) <- const(hash_add_i)
+vbroadcast vconst(hash_mult_i) <- const(hash_mult_i)
 
-const load "const hash_mult0" <VALUE>
-...
-const load "const hash_mult5" <VALUE>
+vbroadcast vconst(forest_values_p) <- vconst(init_vars) @ 3
 
-# Initial vload
-vload "const v_init_vars" <- "const 0"
-
-# Address calculations
-"treevals_addr8" = "const v_init_vars" @ 3 + constn(8)
-"treevals_addr16" = "const v_init_vars" @ 3 + constn(16)
-"treevals_addr24" = "const v_init_vars" @ 3 + constn(24)
-
-# vloads
-vload "const v_treevals_starting0" <- "const v_init_vars" @ 3 (forest_values_p)
-vload "const v_treevals_starting8" <- "treevals_addr8"
-vload "const v_treevals_starting16" <- "treevals_addr16"
-vload "const v_treevals_starting24" <- "treevals_addr24"
-
-# vbroadcasts
-vbroadcast "const v_treeval0" <- const v_treevals_starting0" @ 0
-...
-vbroadcast "const v_treeval7" <- "const v_treevals_starting0" @ 7
-
-vbroadcast "const v_treeval8" <- "const v_treevals_starting8" @ 0
-...
-vbroadcast "const v_treeval15" <- "const v_treevals_starting8" @ 7
-
-vbroadcast "const v_treeval16" <- "const v_treevals_starting16" @ 0
-...
-vbroadcast "const v_treeval23" <- "const v_treevals_starting16" @ 7
-
-vbroadcast "const v_treeval24" <- "const v_treevals_starting24" @ 0
-...
-vbroadcast "const v_treeval31" <- "const v_treevals_starting24" @ 7
-
-vbroadcast "const v_hash_add0" <- "const hash_add0"
-...
-same for mult
-
-vbroadcast "v_forest_values_p" <- "v_init_vars" @ 3 (forest_values_p)
-
-for i in (1, 2, 3, 7, 15)
-vbroadcast "v_i", "i"
+for i in (1, 2, 3, 5)
+vbroadcast vconstn(i) <- constn(i)
 ```
 
 ## initial load
-
-- load init val
-- TODO take a look
-- can we just load a constant, use it, and then throw it away? seems like the best thing to do
 
 ```asm
 out: curr_addr_out, treeval_out
@@ -137,7 +102,6 @@ if 5 shifts:
 
 ## hash
 
-- the odd iterations can be scalarized
 - max vreg: 2 (tmps)
 
 ```asm
@@ -163,203 +127,61 @@ val_out = tmp1_hashround5 op2 tmp2_hashround5; export
 
 ## rounds
 
-- TODO vbroadcast?
-- we need to balance across alu, flow, and load
-- max vreg: 3 (val_out, idx_out, treeval_out)
+### round 0/11
 
-### round 0
+- max active regs: 3 (val_out, parity_out, treeval_out)
 
 in: val_in
-out: val_out, idx_out, treeval_out
+out: val_out, treeval_out, parity_out
 
 ```asm
-hash_in = val_in ^ vconst(treeval0)
+hash_in = val_in ^ vconst(treeval0_round0/11)
 ...val_out = hash(hash_in); export
-parity = val_out % vconstn(2)
-idx_out = parity + vconstn(1); export
+parity_out = val_out % vconstn(2); export 
 
-# alu
-treeval_out = parity * vconst(diff21) + vconst(treeval1)
-# flow: even goes left (1), odd goes right (2)
-treeval_out = parity ? vconst(treeval2) : vconst(treeval1); export
+treeval_out = parity_out ? vconst(treeval2_round0/11) : vconst(treeval1_round0/11); export
 ```
 
-### round 1
+### round 1/12
 
-- TODO check
-
-```asm
-in: val_in, idx_in, treeval_in
-out: val_out, idx_out, treeval_out
-
-
-hash_in = val_in ^ treeval_in
-...val_out = hash(hash_in)
-idx_tmp = 2 * idx_in + 1
-parity = val_out % 2
-idx_out = idx_tmp + parity
-norm_idx = idx_out - 3
-bit0 = norm_idx & 1
-norm_idx_down1 = norm_idx >> 1
-bit1 = norm_idx_down1 & 1
-lerp43 = bit0 * const_v diff43 + const_v treeval3
-lerp65 = bit0 * const_v diff65 + const_v treeval5
-ddiff6543 = lerp65 - lerp43
-treeval_out = bit1 * ddiff6543 + lerp43
-```
-
-### round 1, draft 2
+- max active regs: 5 (val_out, parity_in, parity_curr, idx_out, sel_43)
+  - sel_65 releases parity_curr, treeval_out releases 3
+- hope we don't have too many concurrent round 1s
 
 ```asm
-in: val_in, idx_in, treeval_in
+in: val_in, parity_in (previous/top-level val's parity -- did it go left or right?), treeval_in
 out: val_out, idx_out, treeval_out
 
-
 hash_in = val_in ^ treeval_in
-...val_out = hash(hash_in)
-idx_tmp = 2 * idx_in + 1
-parity = val_out % 2
-idx_out = idx_tmp + parity
-norm_idx = idx_out - 3
-bit0 = norm_idx & 1
-norm_idx_down1 = norm_idx >> 1
-bit1 = norm_idx_down1 & 1
+...val_out = hash(hash_in); export
+parity_curr = val_out % vconstn(2)
+# idx_base = parity_in ? vconstn(5) : vconstn(3)
+idx_base = vconstn(2) * parity_in + 3
+idx_out = idx_base + parity_curr; export
 
-sel43 = bit0 ? vconst treeval4 : vconst treeval3
-sel65 = bit0 ? vconst treeval16 : vconst treeval5
-treeval_out = bit1 ? sel65 : sel43
+sel_43 = parity_curr ? vconst(treeval4_round1/12) : vconst(treeval3_round1/12)
+sel_65 = parity_curr ? vconst(treeval6_round1/12) : vconst(treeval5_round1/12)
+treeval_out = parity_in ? sel_65 : sel_43; export
 ```
 
 ### round 2
 
-- TODO check
+- TODO after we verify that round 1 works
 
-[scratch](https://docs.google.com/spreadsheets/d/1PiXPo-L16TS667PRALQBl8A0-6l5BOEvm7pL1Kl1PI4/edit?gid=0#gid=0)
-
-```asm
-in: val_in, idx_in, treeval_in
-out: val_out, idx_out, treeval_out
-
-hash_in = val_in ^ treeval_in
-...val_out = hash(hash_in); export val_out
-idx_tmp = 2*idx_in + 1
-parity = val_out % 2
-idx_out = idx_tmp + parity
-norm_idx = idx_out - 7
-norm_idx_down1 = norm_idx >> 1
-norm_idx_down2 = norm_idx >> 2
-bit0 = norm_idx & 1
-bit1 = norm_idx_down1 & 1
-bit2 = norm_idx_down2 & 1
-
-lerp87 = bit0 * vconst diff87 + vconst treeval7
-lerp109 = bit0 * vconst diff109 + vconst treeval9
-lerp1211 = bit0 * vconst diff1211 + vconst treeval11
-lerp1413 = bit0 * vconst diff1413 + vconst treeval13
-ddiff10987 = lerp109 - lerp87
-ddiff14131211 = lerp1413 - lerp1211
-
-lerp10987 = bit1 * ddiff10987 + lerp87
-lerp14131211 = bit1 * ddiff14131211 + lerp1211
-dddiff147 = lerp14131211 - lerp10987
-
-treeval_out = bit2 * dddiff147 + lerp10987
-```
-
-### round 2, draft 2
-
-```asm
-in: val_in, idx_in, treeval_in
-out: val_out, idx_out, treeval_out
-
-hash_in = val_in ^ treeval_in
-...val_out = hash(hash_in); export val_out
-idx_tmp = 2*idx_in + 1
-parity = val_out % 2
-idx_out = idx_tmp + parity
-norm_idx = idx_out - 7
-norm_idx_down1 = norm_idx >> 1
-norm_idx_down2 = norm_idx >> 2
-bit0 = norm_idx & 1
-bit1 = norm_idx_down1 & 1
-bit2 = norm_idx_down2 & 1
-
-cond0 = idx_out == 7
-sel0 = cond0 ? vconst7 : vconst14
-cond1 = idx_out == 8
-sel1 = cond1 ? vconst8 : sel0
-cond2 = idx_out == 9
-sel2 = cond2 ? vconst9 : sel1
-
-sel87 = bit0 ? vconst treeval8 : vconst treeval7
-sel109 = bit0 ? vconst treeval10 : vconst treeval9
-sel1211 = bit0 ? vconst treeval12 : vconst treeval11
-sel1413 = bit0 ? vconst treeval14 : vconst treeval13
-
-sel10987 = bit1 ? sel109 : sel87
-sel14131211 = bit1 ? sel1413 : sel1211
-
-treeval_out = bit2 ? sel14131211 : sel10987
-```
-
-### round 3
-
-- TODO check
-
-```asm
-in: val_in, idx_in, treeval_in
-out: val_out, idx_out, treeval_out
-
-hash_in = val_in ^ treeval_in
-...val_out = hash(hash_in); export val_out
-idx_tmp = 2*idx_in + 1
-parity = val_out % 2
-idx_out = idx_tmp + parity
-norm_idx = idx_out - 15
-norm_idx_down1 = norm_idx >> 1
-norm_idx_down2 = norm_idx >> 2
-norm_idx_down3 = norm_idx >> 3
-bit0 = norm_idx & 1
-bit1 = norm_idx_down1 & 1
-bit2 = norm_idx_down2 & 1
-bit3 = norm_idx_down3 & 1
-
-15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30
-
-sel1615 = bit0 ? vconst treeval16 : vconst treeval15
-sel1817 = bit0 ? vconst treeval18 : vconst treeval17
-sel2019 = bit0 ? vconst treeval20 : vconst treeval19
-sel2221 = bit0 ? vconst treeval22 : vconst treeval21
-sel2423 = bit0 ? vconst treeval24 : vconst treeval22
-sel2625 = bit0 ? vconst treeval26 : vconst treeval25
-sel2827 = bit0 ? vconst treeval28 : vconst treeval27
-sel3029 = bit0 ? vconst treeval30 : vconst treeval29
-
-sel1815 = bit1 ? vconst sel1817 : vconst sel1615
-sel2219 = bit1 ? vconst sel2221 : vconst sel2019
-sel2623 = bit1 ? vconst sel2625 : vconst sel2423
-sel3027 = bit1 ? vconst sel3029 : vconst sel2827
-
-sel2215 = bit2 ? vconst sel2219 : vconst sel1815
-sel3023 = bit2 ? vconst sel3027 : vconst sel2623
-
-treeval_out = bit3 ? sel3023 : sel2215
-```
-
-### mid
+### mid (2-9; 13-14)
 
 - at most 4 active at once (val_out, idx_out, val_addrs, treeval_out)
 
 ```asm
 in: val_in, idx_in, treeval_in
-out: val_out, treeval_out, idx_out (if not needed, will be freed by dead code elim)
+out: val_out, treeval_out, idx_out (if not used by next round, will be freed by dead code elim)
 
 hash_in = val_in ^ treeval_in
 ...val_out = hash(hash_in); export
-idx_tmp = vconstn(2) * idx_in + vconstn(1)
+idx_base = vconstn(2) * idx_in + vconstn(1)
 parity = val_out % vconstn(2)
-idx_out = idx_tmp + parity; export (TODO dce?)
-val_addrs = vconst forest_values_p + idx_out
+idx_out = idx_base + parity; export
+val_addrs = vconst(forest_values_p) + idx_out
 
 @i in [0, 8)
 load treeval_out @ i <- val_addrs @ i
@@ -367,9 +189,9 @@ load treeval_out @ i <- val_addrs @ i
 vmerge treeval_out, treeval_out @ 0, treeval_out @ 1,...; export
 ```
 
-### wraparound
+### wraparound (10)
 
-- at most 2 active at once (val_in, treeval_in)
+- at most 2 active at once (inputs)
 
 ```asm
 in: val_in, treeval_in
@@ -379,24 +201,53 @@ hash_in = val_in ^ treeval_in
 ...val_out = hash(hash_in); export
 ```
 
-### last
+### last (15)
 
-- at most 2 active at once (val_in, treeval_in)
+- at most 2 active at once (inputs)
 
 ```asm
-in: val_in, treeval_in, curr_addr_in
+in: val_in, treeval_in
 out: none, no exports
 
 hash_in = val_in ^ treeval_in
 ...val_final = hash(hash_in)
-vstore curr_addr_in, val_final; no dest
+addr_end = vconst(init_vars) @ 3 + batch (use add_imm, flow)
+vstore addr_end, val_final; no dest
 ```
 
-## main
-
-- strings all these together
-- TODO edit
+## batch
 
 ```asm
-curr_addr, val_init = ...init_load()
+addr_start = vconst(init_vars) @ 3 + batch (use add_imm, flow)
+vload vinit_val <- addr_start
+...individual rounds
+```
+
+## kernel
+
+- JIT-vbroadcast treevals when we need them; remove them once all batches done using
+
+```asm
+...consts
+
+# round 0/11 will access 2 layers
+vbroadcast vconst(treeval0_round0) <- vconst(treevals_starting0) @ 0
+vbroadcast vconst(treeval0_round11) <- vconst(treevals_starting0) @ 0
+for i in (1, 2)
+vbroadcast vconst(treeval{i}_round0) <- vconst(treevals_starting0) @ i
+vbroadcast vconst(treeval{i}_round11) <- vconst(treevals_starting0) @ i
+
+# round 1/12 will access 1 layer: 3456
+for i in (3, 4, 5, 6)
+vbroadcast vconst(treeval{i}_round1) <- vconst(treevals_starting0) @ i
+vbroadcast vconst(treeval{i}_round12) <- vconst(treevals_starting0) @ i
+
+# round 2/13 will access 1 layer: 7,8,9,10,11,12,13,14
+vbroadcast vconst(treeval7_round2) <- vconst(treevals_starting0) @ 7
+vbroadcast vconst(treeval7_round13) <- vconst(treevals_starting0) @ 7
+for i in (0, 1, 2, 3, 4, 5, 6)
+vbroadcast vconst(treeval{8+i}_round2) <- vconst(treevals_starting8) @ i
+vbroadcast vconst(treeval{8+i}_round13) <- vconst(treevals_starting8) @ i
+
+...batch graphs
 ```
